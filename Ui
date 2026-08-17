@@ -1,0 +1,141 @@
+-- GrimUI v4.4 | Raw Version | Inspired by Grim Client
+local GrimUI = {}
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+
+local function getUIParent()
+    local success, result = pcall(function() return gethui() end)
+    if success then return result end
+    return CoreGui
+end
+
+function GrimUI:CreateWindow(Settings)
+    Settings = Settings or {}
+    local Window = {}
+    
+    local ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = "GrimUI"
+    ScreenGui.Parent = getUIParent()
+    ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    ScreenGui.ResetOnSpawn = false
+
+    local MainFrame = Instance.new("Frame")
+    MainFrame.Size = UDim2.fromOffset(820, 480)
+    MainFrame.Position = UDim2.fromScale(0.5, 0.5)
+    MainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+    MainFrame.BackgroundColor3 = Color3.fromRGB(28, 29, 34)
+    MainFrame.Parent = ScreenGui
+    Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 16)
+    
+    local Stroke = Instance.new("UIStroke", MainFrame)
+    Stroke.Color = Color3.fromRGB(255,255,255)
+    Stroke.Transparency = 0.92
+    Stroke.Thickness = 1
+
+    -- Header
+    local Header = Instance.new("Frame", MainFrame)
+    Header.Size = UDim2.new(1, 0, 0, 55)
+    Header.BackgroundTransparency = 1
+    Header.Name = "Header"
+
+    local Logo = Instance.new("TextLabel", Header)
+    Logo.Text = "  "..(Settings.Name or "Grim Client")
+    Logo.Font = Enum.Font.GothamBold
+    Logo.TextSize = 14
+    Logo.TextColor3 = Color3.new(1,1,1)
+    Logo.TextXAlignment = Enum.TextXAlignment.Left
+    Logo.Size = UDim2.new(0, 200, 1, 0)
+    Logo.Position = UDim2.fromOffset(15, 0)
+    Logo.BackgroundTransparency = 1
+
+    local TopBar = Instance.new("Frame", Header)
+    TopBar.Size = UDim2.new(1, -220, 0, 36)
+    TopBar.Position = UDim2.fromOffset(180, 10)
+    TopBar.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+    Instance.new("UICorner", TopBar).CornerRadius = UDim.new(0, 10)
+    
+    local TabTitle = Instance.new("TextLabel", TopBar)
+    TabTitle.Text = "  Combat • Automatically hits entity when in range"
+    TabTitle.Font = Enum.Font.GothamMedium
+    TabTitle.TextSize = 12
+    TabTitle.TextColor3 = Color3.fromRGB(200,200,200)
+    TabTitle.TextXAlignment = Enum.TextXAlignment.Left
+    TabTitle.Size = UDim2.new(1, -20, 1, 0)
+    TabTitle.BackgroundTransparency = 1
+    TabTitle.Name = "TitleLabel"
+
+    -- Sidebar
+    local Sidebar = Instance.new("Frame", MainFrame)
+    Sidebar.Size = UDim2.new(0, 160, 1, -65)
+    Sidebar.Position = UDim2.fromOffset(10, 55)
+    Sidebar.BackgroundTransparency = 1
+    local SidebarLayout = Instance.new("UIListLayout", Sidebar)
+    SidebarLayout.Padding = UDim.new(0, 4)
+
+    -- Content
+    local TabsFolder = Instance.new("ScrollingFrame", MainFrame)
+    TabsFolder.Name = "Tabs"
+    TabsFolder.Size = UDim2.new(1, -180, 1, -65)
+    TabsFolder.Position = UDim2.fromOffset(170, 55)
+    TabsFolder.BackgroundTransparency = 1
+    TabsFolder.ScrollBarThickness = 0
+    TabsFolder.CanvasSize = UDim2.new(0,0,0,0)
+    TabsFolder.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    local GridLayout = Instance.new("UIGridLayout", TabsFolder)
+    GridLayout.CellSize = UDim2.fromOffset(305, 52)
+    GridLayout.CellPadding = UDim2.fromOffset(10, 10)
+
+    -- Dragging
+    local dragging, dragStart, startPos
+    Header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true; dragStart = input.Position; startPos = MainFrame.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+            local delta = input.Position - dragStart
+            MainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input) if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end end)
+
+    function Window:CreateTab(Name, Icon)
+        local Button = Instance.new("TextButton", Sidebar)
+        Button.Size = UDim2.fromOffset(140, 32)
+        Button.BackgroundColor3 = Color3.fromRGB(139, 92, 246)
+        Button.BackgroundTransparency = Name == "Combat" and 0 or 1
+        Button.Text = "  "..(Icon or "").."  "..Name
+        Button.Font = Enum.Font.GothamMedium
+        Button.TextSize = 13
+        Button.TextColor3 = Name == "Combat" and Color3.new(1,1,1) or Color3.fromRGB(180,180,180)
+        Button.TextXAlignment = Enum.TextXAlignment.Left
+        Instance.new("UICorner", Button).CornerRadius = UDim.new(0, 8)
+
+        Button.MouseButton1Click:Connect(function()
+            for _,v in pairs(Sidebar:GetChildren()) do if v:IsA("TextButton") then v.BackgroundTransparency = 1; v.TextColor3 = Color3.fromRGB(180,180,180) end end
+            Button.BackgroundTransparency = 0; Button.TextColor3 = Color3.new(1,1,1)
+            TabTitle.Text = "  "..Name.." • ".."Automatically hits entity when in range"
+        end)
+
+        local TabAPI = {}
+        function TabAPI:CreateModule(Config)
+            local Card = Instance.new("TextButton", TabsFolder)
+            Card.BackgroundColor3 = Color3.fromRGB(42, 43, 50)
+            Card.Text = ""; Card.AutoButtonColor = false
+            Instance.new("UICorner", Card).CornerRadius = UDim.new(0, 10)
+            local T = Instance.new("TextLabel", Card); T.Text = Config.Name; T.Font = Enum.Font.GothamBold; T.TextSize = 12; T.TextColor3 = Color3.new(1,1,1); T.Position = UDim2.fromOffset(12, 8); T.Size = UDim2.fromOffset(200, 14); T.BackgroundTransparency = 1; T.TextXAlignment = Enum.TextXAlignment.Left
+            local D = Instance.new("TextLabel", Card); D.Text = Config.Description or ""; D.Font = Enum.Font.Gotham; D.TextSize = 10; D.TextColor3 = Color3.fromRGB(140,140,145); D.Position = UDim2.fromOffset(12, 24); D.Size = UDim2.fromOffset(280, 14); D.BackgroundTransparency = 1; D.TextXAlignment = Enum.TextXAlignment.Left; D.TextTruncated = true
+            local on = false
+            Card.MouseButton1Click:Connect(function()
+                on = not on
+                TweenService:Create(Card, TweenInfo.new(0.15), {BackgroundColor3 = on and Color3.fromRGB(139, 92, 246) or Color3.fromRGB(42, 43, 50)}):Play()
+                if Config.Callback then Config.Callback(on) end
+            end)
+        end
+        return TabAPI
+    end
+    return Window
+end
+return GrimUI
