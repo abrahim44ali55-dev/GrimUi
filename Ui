@@ -1,139 +1,141 @@
--- GrimUI v4.4 | Raw Version | Inspired by Grim Client
+-- GrimUI v5.0 Responsive + Mobile Support
 local GrimUI = {}
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
-local CoreGui = game:GetService("CoreGui")
+local GuiService = game:GetService("GuiService")
 
 local function getUIParent()
-    local success, result = pcall(function() return gethui() end)
-    if success then return result end
-    return CoreGui
+    local ok, res = pcall(function() return gethui() end)
+    if ok then return res end
+    return game.CoreGui
 end
+
+local IsMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+local IsSmallScreen = GuiService:GetScreenResolution().X < 800 or IsMobile
 
 function GrimUI:CreateWindow(Settings)
     Settings = Settings or {}
     local Window = {}
-    
+
     local ScreenGui = Instance.new("ScreenGui")
     ScreenGui.Name = "GrimUI"
     ScreenGui.Parent = getUIParent()
     ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     ScreenGui.ResetOnSpawn = false
+    ScreenGui.IgnoreGuiInset = true
 
+    -- Main Frame - Responsive Size
     local MainFrame = Instance.new("Frame")
-    MainFrame.Size = UDim2.fromOffset(820, 480)
+    MainFrame.Name = "Main"
+    if IsMobile then
+        MainFrame.Size = UDim2.fromScale(0.92, 0.75)
+    else
+        MainFrame.Size = UDim2.fromOffset(IsSmallScreen and 600 or 720, IsSmallScreen and 380 or 420)
+    end
     MainFrame.Position = UDim2.fromScale(0.5, 0.5)
     MainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
     MainFrame.BackgroundColor3 = Color3.fromRGB(28, 29, 34)
     MainFrame.Parent = ScreenGui
-    Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 16)
-    
-    local Stroke = Instance.new("UIStroke", MainFrame)
-    Stroke.Color = Color3.fromRGB(255,255,255)
-    Stroke.Transparency = 0.92
-    Stroke.Thickness = 1
+    Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 14)
+    local Stroke = Instance.new("UIStroke", MainFrame); Stroke.Color = Color3.fromRGB(255,255,255); Stroke.Transparency = 0.92; Stroke.Thickness = 1
 
     -- Header
     local Header = Instance.new("Frame", MainFrame)
-    Header.Size = UDim2.new(1, 0, 0, 55)
+    Header.Size = UDim2.new(1, 0, 0, 45)
     Header.BackgroundTransparency = 1
     Header.Name = "Header"
 
     local Logo = Instance.new("TextLabel", Header)
     Logo.Text = "  "..(Settings.Name or "Grim Client")
     Logo.Font = Enum.Font.GothamBold
-    Logo.TextSize = 14
+    Logo.TextSize = IsMobile and 12 or 14
     Logo.TextColor3 = Color3.new(1,1,1)
     Logo.TextXAlignment = Enum.TextXAlignment.Left
-    Logo.Size = UDim2.new(0, 200, 1, 0)
-    Logo.Position = UDim2.fromOffset(15, 0)
+    Logo.Size = UDim2.new(0, 150, 1, 0)
+    Logo.Position = UDim2.fromOffset(10, 0)
     Logo.BackgroundTransparency = 1
 
-    local TopBar = Instance.new("Frame", Header)
-    TopBar.Size = UDim2.new(1, -220, 0, 36)
-    TopBar.Position = UDim2.fromOffset(180, 10)
-    TopBar.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
-    Instance.new("UICorner", TopBar).CornerRadius = UDim.new(0, 10)
-    
-    local TabTitle = Instance.new("TextLabel", TopBar)
-    TabTitle.Text = "  Combat • Automatically hits entity when in range"
-    TabTitle.Font = Enum.Font.GothamMedium
-    TabTitle.TextSize = 12
-    TabTitle.TextColor3 = Color3.fromRGB(200,200,200)
-    TabTitle.TextXAlignment = Enum.TextXAlignment.Left
-    TabTitle.Size = UDim2.new(1, -20, 1, 0)
-    TabTitle.BackgroundTransparency = 1
-    TabTitle.Name = "TitleLabel"
+    -- Top Controls
+    local Controls = Instance.new("Frame", Header)
+    Controls.Size = UDim2.fromOffset(70, 30)
+    Controls.Position = UDim2.new(1, -75, 0.5, -15)
+    Controls.BackgroundTransparency = 1
+    local CLayout = Instance.new("UIListLayout", Controls); CLayout.FillDirection = Enum.FillDirection.Horizontal; CLayout.Padding = UDim.new(0,6)
 
-    -- Sidebar
-    local Sidebar = Instance.new("Frame", MainFrame)
-    Sidebar.Size = UDim2.new(0, 160, 1, -65)
-    Sidebar.Position = UDim2.fromOffset(10, 55)
-    Sidebar.BackgroundTransparency = 1
-    local SidebarLayout = Instance.new("UIListLayout", Sidebar)
-    SidebarLayout.Padding = UDim.new(0, 4)
+    local MinBtn = Instance.new("TextButton", Controls)
+    MinBtn.Size = UDim2.fromOffset(30, 30); MinBtn.Text = "-"; MinBtn.Font = Enum.Font.GothamBold; MinBtn.TextSize = 16; MinBtn.BackgroundColor3 = Color3.fromRGB(40,40,45); MinBtn.TextColor3 = Color3.new(1,1,1)
+    Instance.new("UICorner", MinBtn).CornerRadius = UDim.new(0, 8)
 
-    -- Content
+    local CloseBtn = Instance.new("TextButton", Controls)
+    CloseBtn.Size = UDim2.fromOffset(30, 30); CloseBtn.Text = "X"; CloseBtn.Font = Enum.Font.GothamBold; CloseBtn.TextSize = 12; CloseBtn.BackgroundColor3 = Color3.fromRGB(80,30,30); CloseBtn.TextColor3 = Color3.new(1,1,1)
+    Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 8)
+
+    -- Confirm Dialog
+    local ConfirmFrame = Instance.new("Frame", MainFrame)
+    ConfirmFrame.Size = UDim2.fromScale(1,1); ConfirmFrame.BackgroundColor3 = Color3.fromRGB(0,0,0); ConfirmFrame.BackgroundTransparency = 0.4; ConfirmFrame.Visible = false; ConfirmFrame.ZIndex = 10
+    Instance.new("UICorner", ConfirmFrame).CornerRadius = UDim.new(0, 14)
+    local ConfirmBox = Instance.new("Frame", ConfirmFrame); ConfirmBox.Size = UDim2.fromOffset(260, 130); ConfirmBox.Position = UDim2.fromScale(0.5,0.5); ConfirmBox.AnchorPoint = Vector2.new(0.5,0.5); ConfirmBox.BackgroundColor3 = Color3.fromRGB(35,36,42); ConfirmBox.ZIndex = 11
+    Instance.new("UICorner", ConfirmBox).CornerRadius = UDim.new(0, 12)
+    local CT = Instance.new("TextLabel", ConfirmBox); CT.Text = "هل تريد إغلاق الواجهة؟"; CT.Size = UDim2.new(1,0,0,50); CT.Font = Enum.Font.GothamBold; CT.TextSize = 14; CT.TextColor3 = Color3.new(1,1,1); CT.BackgroundTransparency = 1; CT.ZIndex = 11
+    local YesBtn = Instance.new("TextButton", ConfirmBox); YesBtn.Size = UDim2.fromOffset(100, 32); YesBtn.Position = UDim2.fromOffset(20, 80); YesBtn.Text = "نعم"; YesBtn.BackgroundColor3 = Color3.fromRGB(139,92,246); YesBtn.TextColor3 = Color3.new(1,1,1); YesBtn.Font = Enum.Font.GothamBold; YesBtn.ZIndex = 11; Instance.new("UICorner", YesBtn).CornerRadius = UDim.new(0, 8)
+    local NoBtn = Instance.new("TextButton", ConfirmBox); NoBtn.Size = UDim2.fromOffset(100, 32); NoBtn.Position = UDim2.fromOffset(140, 80); NoBtn.Text = "لا"; NoBtn.BackgroundColor3 = Color3.fromRGB(50,50,55); NoBtn.TextColor3 = Color3.new(1,1,1); NoBtn.Font = Enum.Font.GothamBold; NoBtn.ZIndex = 11; Instance.new("UICorner", NoBtn).CornerRadius = UDim.new(0, 8)
+    CloseBtn.MouseButton1Click:Connect(function() ConfirmFrame.Visible = true end)
+    NoBtn.MouseButton1Click:Connect(function() ConfirmFrame.Visible = false end)
+    YesBtn.MouseButton1Click:Connect(function() ScreenGui:Destroy() end)
+
+    -- Minimize logic
+    local Minimized = false
+    local MiniIcon = Instance.new("TextButton", ScreenGui); MiniIcon.Size = UDim2.fromOffset(50,50); MiniIcon.Position = UDim2.fromScale(0.05,0.1); MiniIcon.Text = "G"; MiniIcon.Font = Enum.Font.GothamBold; MiniIcon.TextSize = 20; MiniIcon.BackgroundColor3 = Color3.fromRGB(139,92,246); MiniIcon.TextColor3 = Color3.new(1,1,1); MiniIcon.Visible = false; Instance.new("UICorner", MiniIcon).CornerRadius = UDim.new(1,0); MiniIcon.Draggable = true
+    MinBtn.MouseButton1Click:Connect(function()
+        Minimized = not Minimized
+        TweenService:Create(MainFrame, TweenInfo.new(0.3), {Size = Minimized and UDim2.fromOffset(0,0) or (IsMobile and UDim2.fromScale(0.92,0.75) or UDim2.fromOffset(720,420))}):Play()
+        MainFrame.Visible = not Minimized; MiniIcon.Visible = Minimized
+    end)
+    MiniIcon.MouseButton1Click:Connect(function() Minimized = false; MainFrame.Visible = true; MiniIcon.Visible = false; TweenService:Create(MainFrame, TweenInfo.new(0.3), {Size = IsMobile and UDim2.fromScale(0.92,0.75) or UDim2.fromOffset(720,420)}):Play() end)
+
+    -- Layout: Sidebar + Content
+    local Sidebar = Instance.new("ScrollingFrame", MainFrame)
+    Sidebar.Size = IsMobile and UDim2.new(1,0,0,45) or UDim2.new(0,140,1,-50)
+    Sidebar.Position = IsMobile and UDim2.fromOffset(0,45) or UDim2.fromOffset(10,50)
+    Sidebar.BackgroundTransparency = 1; Sidebar.ScrollBarThickness = 0; Sidebar.AutomaticCanvasSize = Enum.AutomaticSize.X
+    local SLayout = Instance.new("UIListLayout", Sidebar); SLayout.Padding = UDim.new(0,4); SLayout.FillDirection = IsMobile and Enum.FillDirection.Horizontal or Enum.FillDirection.Vertical
+
     local TabsFolder = Instance.new("ScrollingFrame", MainFrame)
-    TabsFolder.Name = "Tabs"
-    TabsFolder.Size = UDim2.new(1, -180, 1, -65)
-    TabsFolder.Position = UDim2.fromOffset(170, 55)
-    TabsFolder.BackgroundTransparency = 1
-    TabsFolder.ScrollBarThickness = 0
-    TabsFolder.CanvasSize = UDim2.new(0,0,0,0)
-    TabsFolder.AutomaticCanvasSize = Enum.AutomaticSize.Y
-    local GridLayout = Instance.new("UIGridLayout", TabsFolder)
-    GridLayout.CellSize = UDim2.fromOffset(305, 52)
-    GridLayout.CellPadding = UDim2.fromOffset(10, 10)
+    TabsFolder.Name = "Tabs"; TabsFolder.Size = IsMobile and UDim2.new(1,-10,1,-100) or UDim2.new(1,-160,1,-60)
+    TabsFolder.Position = IsMobile and UDim2.fromOffset(5,95) or UDim2.fromOffset(155,50)
+    TabsFolder.BackgroundTransparency = 1; TabsFolder.ScrollBarThickness = 2; TabsFolder.CanvasSize = UDim2.new(0,0,0,0); TabsFolder.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    local GridLayout = Instance.new("UIGridLayout", TabsFolder); GridLayout.CellSize = IsMobile and UDim2.fromOffset(165,55) or UDim2.fromOffset(270,55); GridLayout.CellPadding = UDim2.fromOffset(8,8)
 
     -- Dragging
     local dragging, dragStart, startPos
-    Header.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging = true; dragStart = input.Position; startPos = MainFrame.Position
-        end
-    end)
-    UserInputService.InputChanged:Connect(function(input)
-        if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
-            local delta = input.Position - dragStart
-            MainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-        end
-    end)
-    UserInputService.InputEnded:Connect(function(input) if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end end)
+    Header.InputBegan:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging=true; dragStart=i.Position; startPos=MainFrame.Position end end)
+    UserInputService.InputChanged:Connect(function(i) if dragging and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then local d=i.Position-dragStart; MainFrame.Position=UDim2.new(startPos.X.Scale, startPos.X.Offset+d.X, startPos.Y.Scale, startPos.Y.Offset+d.Y) end end)
+    UserInputService.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then dragging=false end end)
 
     function Window:CreateTab(Name, Icon)
         local Button = Instance.new("TextButton", Sidebar)
-        Button.Size = UDim2.fromOffset(140, 32)
-        Button.BackgroundColor3 = Color3.fromRGB(139, 92, 246)
-        Button.BackgroundTransparency = Name == "Combat" and 0 or 1
-        Button.Text = "  "..(Icon or "").."  "..Name
-        Button.Font = Enum.Font.GothamMedium
-        Button.TextSize = 13
-        Button.TextColor3 = Name == "Combat" and Color3.new(1,1,1) or Color3.fromRGB(180,180,180)
-        Button.TextXAlignment = Enum.TextXAlignment.Left
-        Instance.new("UICorner", Button).CornerRadius = UDim.new(0, 8)
-
-        Button.MouseButton1Click:Connect(function()
-            for _,v in pairs(Sidebar:GetChildren()) do if v:IsA("TextButton") then v.BackgroundTransparency = 1; v.TextColor3 = Color3.fromRGB(180,180,180) end end
-            Button.BackgroundTransparency = 0; Button.TextColor3 = Color3.new(1,1,1)
-            TabTitle.Text = "  "..Name.." • ".."Automatically hits entity when in range"
-        end)
-
+        Button.Size = UDim2.fromOffset(110,32); Button.BackgroundColor3 = Color3.fromRGB(139,92,246); Button.BackgroundTransparency = Name=="Combat" and 0 or 1; Button.Text = (Icon or "").." "..Name; Button.Font = Enum.Font.GothamMedium; Button.TextSize = 12; Button.TextColor3 = Name=="Combat" and Color3.new(1,1,1) or Color3.fromRGB(180,180,180); Button.TextXAlignment=Enum.TextXAlignment.Left; Instance.new("UICorner", Button).CornerRadius=UDim.new(0,8)
         local TabAPI = {}
-        function TabAPI:CreateModule(Config)
-            local Card = Instance.new("TextButton", TabsFolder)
-            Card.BackgroundColor3 = Color3.fromRGB(42, 43, 50)
-            Card.Text = ""; Card.AutoButtonColor = false
-            Instance.new("UICorner", Card).CornerRadius = UDim.new(0, 10)
-            local T = Instance.new("TextLabel", Card); T.Text = Config.Name; T.Font = Enum.Font.GothamBold; T.TextSize = 12; T.TextColor3 = Color3.new(1,1,1); T.Position = UDim2.fromOffset(12, 8); T.Size = UDim2.fromOffset(200, 14); T.BackgroundTransparency = 1; T.TextXAlignment = Enum.TextXAlignment.Left
-            local D = Instance.new("TextLabel", Card); D.Text = Config.Description or ""; D.Font = Enum.Font.Gotham; D.TextSize = 10; D.TextColor3 = Color3.fromRGB(140,140,145); D.Position = UDim2.fromOffset(12, 24); D.Size = UDim2.fromOffset(280, 14); D.BackgroundTransparency = 1; D.TextXAlignment = Enum.TextXAlignment.Left; D.TextTruncated = true
-            local on = false
-            Card.MouseButton1Click:Connect(function()
-                on = not on
-                TweenService:Create(Card, TweenInfo.new(0.15), {BackgroundColor3 = on and Color3.fromRGB(139, 92, 246) or Color3.fromRGB(42, 43, 50)}):Play()
-                if Config.Callback then Config.Callback(on) end
-            end)
+        function TabAPI:CreateModule(c) self:CreateToggle(c) end
+        function TabAPI:CreateToggle(c)
+            local Card = Instance.new("TextButton", TabsFolder); Card.BackgroundColor3 = Color3.fromRGB(42,43,50); Card.Text=""; Card.AutoButtonColor=false; Instance.new("UICorner", Card).CornerRadius=UDim.new(0,10)
+            local T = Instance.new("TextLabel", Card); T.Text=c.Name; T.Font=Enum.Font.GothamBold; T.TextSize=11; T.TextColor3=Color3.new(1,1,1); T.Position=UDim2.fromOffset(10,6); T.Size=UDim2.fromOffset(150,14); T.BackgroundTransparency=1; T.TextXAlignment=Enum.TextXAlignment.Left; T.TextTruncated=true
+            local D = Instance.new("TextLabel", Card); D.Text=c.Description or ""; D.Font=Enum.Font.Gotham; D.TextSize=9; D.TextColor3=Color3.fromRGB(140,140,145); D.Position=UDim2.fromOffset(10,22); D.Size=UDim2.fromOffset(150,20); D.BackgroundTransparency=1; D.TextXAlignment=Enum.TextXAlignment.Left; D.TextWrapped=true
+            local on=false; Card.MouseButton1Click:Connect(function() on=not on; TweenService:Create(Card, TweenInfo.new(0.15), {BackgroundColor3=on and Color3.fromRGB(139,92,246) or Color3.fromRGB(42,43,50)}):Play(); if c.Callback then c.Callback(on) end end)
+            return Card
         end
+        function TabAPI:CreateButton(c)
+            local Card = Instance.new("TextButton", TabsFolder); Card.BackgroundColor3 = Color3.fromRGB(50,50,60); Card.Text=c.Name; Card.Font=Enum.Font.GothamBold; Card.TextSize=11; Card.TextColor3=Color3.new(1,1,1); Instance.new("UICorner", Card).CornerRadius=UDim.new(0,10)
+            Card.MouseButton1Click:Connect(function() if c.Callback then c.Callback() end end); return Card
+        end
+        function TabAPI:CreateSlider(c)
+            local Card = Instance.new("Frame", TabsFolder); Card.BackgroundColor3 = Color3.fromRGB(42,43,50); Instance.new("UICorner", Card).CornerRadius=UDim.new(0,10)
+            local T = Instance.new("TextLabel", Card); T.Text=c.Name.." : "..(c.Default or c.Min); T.Font=Enum.Font.GothamBold; T.TextSize=11; T.TextColor3=Color3.new(1,1,1); T.Size=UDim2.new(1,-10,0,20); T.Position=UDim2.fromOffset(10,5); T.BackgroundTransparency=1; T.TextXAlignment=Enum.TextXAlignment.Left
+            local Bar = Instance.new("Frame", Card); Bar.Size=UDim2.new(1,-20,0,6); Bar.Position=UDim2.fromOffset(10,32); Bar.BackgroundColor3=Color3.fromRGB(60,60,70); Instance.new("UICorner", Bar).CornerRadius=UDim.new(1,0)
+            local Fill = Instance.new("Frame", Bar); Fill.Size=UDim2.fromScale(0.5,1); Fill.BackgroundColor3=Color3.fromRGB(139,92,246); Instance.new("UICorner", Fill).CornerRadius=UDim.new(1,0)
+            return Card
+        end
+        Button.MouseButton1Click:Connect(function() for _,v in pairs(Sidebar:GetChildren()) do if v:IsA("TextButton") then v.BackgroundTransparency=1; v.TextColor3=Color3.fromRGB(180,180,180) end end; Button.BackgroundTransparency=0; Button.TextColor3=Color3.new(1,1,1) end)
         return TabAPI
     end
     return Window
