@@ -1,0 +1,3142 @@
+--[[
+================================================================================
+   ULTRA FUSION UI ENGINE — v2.0.0 MASTER ENTERPRISE EDITION
+   Complete Single-File Roblox Luau UI Library
+   16 Internal Engines | 30 UI Elements | Full Legacy Compatibility Layer
+================================================================================
+]]
+
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local TextService = game:GetService("TextService")
+local Players = game:GetService("Players")
+
+-- ============================================================================
+-- MODULE 1: LIFECYCLE & CLEANUP MANAGER (IDEMPOTENT HIERARCHICAL MAID)
+-- ============================================================================
+local Lifecycle = {}
+Lifecycle.__index = Lifecycle
+
+function Lifecycle.new()
+	return setmetatable({
+		_tasks = {},
+		_destroyed = false,
+	}, Lifecycle)
+end
+
+function Lifecycle:Add(taskObj)
+	if self._destroyed then
+		Lifecycle._cleanupTask(taskObj)
+		return taskObj
+	end
+	table.insert(self._tasks, taskObj)
+	return taskObj
+end
+
+function Lifecycle:Connect(signal, callback)
+	if self._destroyed or not signal then return nil end
+	local conn = signal:Connect(callback)
+	table.insert(self._tasks, conn)
+	return conn
+end
+
+function Lifecycle._cleanupTask(t)
+	local tType = typeof(t)
+	if tType == "RBXScriptConnection" then
+		if t.Connected then pcall(function() t:Disconnect() end) end
+	elseif tType == "Instance" then
+		pcall(function() t:Destroy() end)
+	elseif tType == "function" then
+		pcall(t)
+	elseif tType == "thread" then
+		pcall(task.cancel, t)
+	elseif tType == "table" then
+		if type(t.Destroy) == "function" then
+			pcall(function() t:Destroy() end)
+		elseif type(t.Disconnect) == "function" then
+			pcall(function() t:Disconnect() end)
+		elseif type(t.Cancel) == "function" then
+			pcall(function() t:Cancel() end)
+		end
+	end
+end
+
+function Lifecycle:Clean()
+	local tasks = self._tasks
+	self._tasks = {}
+	for i = #tasks, 1, -1 do
+		Lifecycle._cleanupTask(tasks[i])
+		tasks[i] = nil
+	end
+end
+
+function Lifecycle:Destroy()
+	if self._destroyed then
+		return false -- Safe idempotent no-op on repeated calls
+	end
+	self._destroyed = true
+	self:Clean()
+	return true
+end
+
+function Lifecycle:IsDestroyed()
+	return self._destroyed
+end
+
+function Lifecycle:GetActiveTaskCount()
+	return #self._tasks
+end
+
+-- ============================================================================
+-- MODULE 2: ERROR HANDLING & DIAGNOSTICS ENGINE
+-- ============================================================================
+local Diagnostics = {
+	DebugMode = false,
+	Logs = {},
+	Listeners = {},
+}
+
+function Diagnostics:SetDebugMode(enabled)
+	self.DebugMode = enabled == true
+end
+
+function Diagnostics:Log(level, scope, message)
+	local entry = {
+		Time = os.clock(),
+		Level = tostring(level),
+		Scope = tostring(scope),
+		Message = tostring(message),
+	}
+	table.insert(self.Logs, entry)
+	if #self.Logs > 250 then
+		table.remove(self.Logs, 1)
+	end
+	if self.DebugMode or level == "ERROR" or level == "WARN" then
+		warn(string.format("[UltraFusion.%s] [%s]: %s", entry.Level, entry.Scope, entry.Message))
+	end
+	for _, fn in ipairs(self.Listeners) do
+		task.spawn(pcall, fn, entry)
+	end
+	return entry
+end
+
+function Diagnostics:SafeCallback(scope, callback, onErrorVisual, ...)
+	if type(callback) ~= "function" then
+		return true, nil
+	end
+	local args = table.pack(...)
+	local ok, res = xpcall(function()
+		return callback(table.unpack(args, 1, args.n))
+	end, function(err)
+		return debug.traceback(tostring(err), 2)
+	end)
+
+	if not ok then
+		local shortErr = tostring(res):match(":%d+: ([^\n]+)") or tostring(res)
+		self:Log("ERROR", scope or "Callback", shortErr)
+		if type(onErrorVisual) == "function" then
+			task.spawn(pcall, onErrorVisual, shortErr)
+		end
+		return false, shortErr
+	end
+	return true, res
+end
+
+-- ============================================================================
+-- MODULE 3: ANIMATION MANAGER (SPRING SOLVER + TWEEN DEDUPLICATION)
+-- ============================================================================
+local AnimationManager = {
+	ActiveTweens = setmetatable({}, { __mode = "k" }),
+	ActiveSprings = {},
+	SpringConn = nil,
+}
+
+function AnimationManager:Tween(instance, props, duration, easingStyle, easingDirection, onComplete)
+	if not instance or not instance.Parent then return nil end
+	duration = duration or 0.2
+	easingStyle = easingStyle or Enum.EasingStyle.Quint
+	easingDirection = easingDirection or Enum.EasingDirection.Out
+
+	local changed = false
+	for k, v in pairs(props) do
+		local ok, cur = pcall(function() return instance[k] end)
+		if ok and cur ~= v then
+			changed = true
+			break
+		end
+	end
+	if not changed then
+		if onComplete then task.spawn(onComplete) end
+		return nil
+	end
+
+	if self.ActiveTweens[instance] then
+		pcall(function() self.ActiveTweens[instance]:Cancel() end)
+	end
+
+	local tw = TweenService:Create(instance, TweenInfo.new(duration, easingStyle, easingDirection), props)
+	self.ActiveTweens[instance] = tw
+	if onComplete then
+		tw.Completed:Once(function(state)
+			if self.ActiveTweens[instance] == tw then
+				self.ActiveTweens[instance] = nil
+			end
+			if state == Enum.PlaybackState.Completed then
+				pcall(onComplete)
+			end
+		end)
+	end
+	tw:Play()
+	return tw
+end
+
+function AnimationManager:CreateSpring(initialValue, onStep, frequency, dampingRatio)
+	local spring = {
+		Value = initialValue or 0,
+		Target = initialValue or 0,
+		Velocity = 0,
+		Frequency = frequency or 7,
+		Damping = dampingRatio or 1,
+		OnStep = onStep,
+		Completed = true,
+	}
+
+	function spring:SetGoal(target, instant)
+		self.Target = target
+		if instant then
+			self.Value = target
+			self.Velocity = 0
+			self.Completed = true
+			if self.OnStep then pcall(self.OnStep, self.Value) end
+			return
+		end
+		self.Completed = false
+		if not table.find(AnimationManager.ActiveSprings, self) then
+			table.insert(AnimationManager.ActiveSprings, self)
+		end
+		if not AnimationManager.SpringConn then
+			AnimationManager.SpringConn = RunService.RenderStepped:Connect(function(dt)
+				for i = #AnimationManager.ActiveSprings, 1, -1 do
+					local s = AnimationManager.ActiveSprings[i]
+					if s:Step(dt) then
+						table.remove(AnimationManager.ActiveSprings, i)
+					end
+				end
+				if #AnimationManager.ActiveSprings == 0 and AnimationManager.SpringConn then
+					AnimationManager.SpringConn:Disconnect()
+					AnimationManager.SpringConn = nil
+				end
+			end)
+		end
+	end
+
+	function spring:Step(dt)
+		if self.Completed then return true end
+		dt = math.min(dt, 0.1)
+		local f = self.Frequency * 2 * math.pi
+		local offset = self.Value - self.Target
+		local decay = math.exp(-f * dt)
+		local nextVal = (offset * (1 + f * dt) + self.Velocity * dt) * decay + self.Target
+		local nextVel = (self.Velocity * (1 - f * dt) - offset * (f * f * dt)) * decay
+
+		if math.abs(nextVel) < 0.001 and math.abs(nextVal - self.Target) < 0.001 then
+			self.Value = self.Target
+			self.Velocity = 0
+			self.Completed = true
+		else
+			self.Value = nextVal
+			self.Velocity = nextVel
+		end
+		if self.OnStep then pcall(self.OnStep, self.Value) end
+		return self.Completed
+	end
+
+	function spring:Destroy()
+		self.Completed = true
+		self.OnStep = nil
+	end
+
+	return spring
+end
+
+-- ============================================================================
+-- MODULE 4: THEME ENGINE & DESIGN TOKENS (12 PRESETS + CUSTOM TOKEN REGISTRY)
+-- ============================================================================
+local ThemeEngine = {
+	Current = "ObsidianDark",
+	BoundObjects = setmetatable({}, { __mode = "k" }),
+	Listeners = {},
+	Presets = {
+		ObsidianDark = {
+			Name = "ObsidianDark", Mode = "Dark",
+			WindowBg = Color3.fromRGB(15, 17, 23),
+			SidebarBg = Color3.fromRGB(19, 22, 30),
+			HeaderBg = Color3.fromRGB(20, 23, 32),
+			SectionBg = Color3.fromRGB(22, 26, 36),
+			ElementBg = Color3.fromRGB(27, 32, 44),
+			ElementBgHover = Color3.fromRGB(34, 40, 56),
+			ElementBgActive = Color3.fromRGB(42, 49, 68),
+			InputBg = Color3.fromRGB(17, 20, 28),
+			DropdownBg = Color3.fromRGB(21, 25, 35),
+			ModalBg = Color3.fromRGB(19, 23, 33),
+			TextPrimary = Color3.fromRGB(242, 245, 250),
+			TextSecondary = Color3.fromRGB(162, 172, 192),
+			TextMuted = Color3.fromRGB(108, 118, 140),
+			Accent = Color3.fromRGB(59, 130, 246),
+			AccentText = Color3.fromRGB(255, 255, 255),
+			Border = Color3.fromRGB(45, 53, 72),
+			BorderStrong = Color3.fromRGB(68, 80, 108),
+			Divider = Color3.fromRGB(36, 42, 58),
+			Success = Color3.fromRGB(16, 185, 129),
+			Warning = Color3.fromRGB(245, 158, 11),
+			Error = Color3.fromRGB(239, 68, 68),
+			Info = Color3.fromRGB(59, 130, 246),
+			CornerWindow = 14, CornerElement = 10, CornerSmall = 6,
+			WindowTransparency = 0.03, ElementTransparency = 0, AnimSpeed = 0.18,
+		},
+		AlabasterLight = {
+			Name = "AlabasterLight", Mode = "Light",
+			WindowBg = Color3.fromRGB(248, 250, 252),
+			SidebarBg = Color3.fromRGB(241, 245, 249),
+			HeaderBg = Color3.fromRGB(255, 255, 255),
+			SectionBg = Color3.fromRGB(241, 245, 249),
+			ElementBg = Color3.fromRGB(255, 255, 255),
+			ElementBgHover = Color3.fromRGB(241, 245, 249),
+			ElementBgActive = Color3.fromRGB(226, 232, 240),
+			InputBg = Color3.fromRGB(248, 250, 252),
+			DropdownBg = Color3.fromRGB(255, 255, 255),
+			ModalBg = Color3.fromRGB(255, 255, 255),
+			TextPrimary = Color3.fromRGB(15, 23, 42),
+			TextSecondary = Color3.fromRGB(71, 85, 105),
+			TextMuted = Color3.fromRGB(148, 163, 184),
+			Accent = Color3.fromRGB(37, 99, 235),
+			AccentText = Color3.fromRGB(255, 255, 255),
+			Border = Color3.fromRGB(226, 232, 240),
+			BorderStrong = Color3.fromRGB(203, 213, 225),
+			Divider = Color3.fromRGB(226, 232, 240),
+			Success = Color3.fromRGB(5, 150, 105),
+			Warning = Color3.fromRGB(217, 119, 6),
+			Error = Color3.fromRGB(220, 38, 38),
+			Info = Color3.fromRGB(37, 99, 235),
+			CornerWindow = 14, CornerElement = 10, CornerSmall = 6,
+			WindowTransparency = 0.01, ElementTransparency = 0, AnimSpeed = 0.18,
+		},
+		EmeraldMatrix = {
+			Name = "EmeraldMatrix", Mode = "Dark",
+			WindowBg = Color3.fromRGB(10, 18, 15),
+			SidebarBg = Color3.fromRGB(13, 24, 20),
+			HeaderBg = Color3.fromRGB(15, 28, 23),
+			SectionBg = Color3.fromRGB(18, 34, 28),
+			ElementBg = Color3.fromRGB(21, 41, 33),
+			ElementBgHover = Color3.fromRGB(27, 52, 42),
+			ElementBgActive = Color3.fromRGB(34, 64, 52),
+			InputBg = Color3.fromRGB(12, 22, 18),
+			DropdownBg = Color3.fromRGB(16, 30, 24),
+			ModalBg = Color3.fromRGB(15, 28, 23),
+			TextPrimary = Color3.fromRGB(236, 253, 245),
+			TextSecondary = Color3.fromRGB(167, 243, 208),
+			TextMuted = Color3.fromRGB(110, 175, 148),
+			Accent = Color3.fromRGB(16, 185, 129),
+			AccentText = Color3.fromRGB(6, 20, 14),
+			Border = Color3.fromRGB(34, 68, 55),
+			BorderStrong = Color3.fromRGB(52, 105, 84),
+			Divider = Color3.fromRGB(28, 54, 44),
+			Success = Color3.fromRGB(52, 211, 153),
+			Warning = Color3.fromRGB(251, 191, 36),
+			Error = Color3.fromRGB(248, 113, 113),
+			Info = Color3.fromRGB(56, 189, 248),
+			CornerWindow = 14, CornerElement = 10, CornerSmall = 6,
+			WindowTransparency = 0.03, ElementTransparency = 0, AnimSpeed = 0.18,
+		},
+		CrimsonForge = {
+			Name = "CrimsonForge", Mode = "Dark",
+			WindowBg = Color3.fromRGB(20, 12, 14),
+			SidebarBg = Color3.fromRGB(26, 15, 18),
+			HeaderBg = Color3.fromRGB(30, 17, 21),
+			SectionBg = Color3.fromRGB(36, 20, 25),
+			ElementBg = Color3.fromRGB(44, 24, 30),
+			ElementBgHover = Color3.fromRGB(56, 30, 38),
+			ElementBgActive = Color3.fromRGB(68, 36, 46),
+			InputBg = Color3.fromRGB(22, 13, 16),
+			DropdownBg = Color3.fromRGB(30, 17, 21),
+			ModalBg = Color3.fromRGB(28, 16, 20),
+			TextPrimary = Color3.fromRGB(255, 241, 242),
+			TextSecondary = Color3.fromRGB(254, 205, 211),
+			TextMuted = Color3.fromRGB(190, 135, 145),
+			Accent = Color3.fromRGB(244, 63, 94),
+			AccentText = Color3.fromRGB(255, 255, 255),
+			Border = Color3.fromRGB(76, 38, 48),
+			BorderStrong = Color3.fromRGB(110, 52, 66),
+			Divider = Color3.fromRGB(60, 30, 38),
+			Success = Color3.fromRGB(16, 185, 129),
+			Warning = Color3.fromRGB(245, 158, 11),
+			Error = Color3.fromRGB(248, 113, 113),
+			Info = Color3.fromRGB(59, 130, 246),
+			CornerWindow = 14, CornerElement = 10, CornerSmall = 6,
+			WindowTransparency = 0.03, ElementTransparency = 0, AnimSpeed = 0.18,
+		},
+		AmethystRoyal = {
+			Name = "AmethystRoyal", Mode = "Dark",
+			WindowBg = Color3.fromRGB(17, 13, 26),
+			SidebarBg = Color3.fromRGB(22, 17, 34),
+			HeaderBg = Color3.fromRGB(25, 19, 39),
+			SectionBg = Color3.fromRGB(30, 23, 46),
+			ElementBg = Color3.fromRGB(36, 28, 56),
+			ElementBgHover = Color3.fromRGB(46, 36, 72),
+			ElementBgActive = Color3.fromRGB(56, 44, 88),
+			InputBg = Color3.fromRGB(19, 14, 30),
+			DropdownBg = Color3.fromRGB(26, 20, 42),
+			ModalBg = Color3.fromRGB(24, 18, 38),
+			TextPrimary = Color3.fromRGB(245, 243, 255),
+			TextSecondary = Color3.fromRGB(221, 214, 254),
+			TextMuted = Color3.fromRGB(155, 142, 195),
+			Accent = Color3.fromRGB(139, 92, 246),
+			AccentText = Color3.fromRGB(255, 255, 255),
+			Border = Color3.fromRGB(62, 48, 96),
+			BorderStrong = Color3.fromRGB(88, 68, 136),
+			Divider = Color3.fromRGB(48, 37, 74),
+			Success = Color3.fromRGB(16, 185, 129),
+			Warning = Color3.fromRGB(245, 158, 11),
+			Error = Color3.fromRGB(239, 68, 68),
+			Info = Color3.fromRGB(96, 165, 250),
+			CornerWindow = 14, CornerElement = 10, CornerSmall = 6,
+			WindowTransparency = 0.03, ElementTransparency = 0, AnimSpeed = 0.18,
+		},
+		MidnightOcean = {
+			Name = "MidnightOcean", Mode = "Dark",
+			WindowBg = Color3.fromRGB(10, 18, 28),
+			SidebarBg = Color3.fromRGB(13, 24, 38),
+			HeaderBg = Color3.fromRGB(15, 28, 44),
+			SectionBg = Color3.fromRGB(18, 34, 52),
+			ElementBg = Color3.fromRGB(22, 41, 64),
+			ElementBgHover = Color3.fromRGB(28, 52, 80),
+			ElementBgActive = Color3.fromRGB(35, 64, 98),
+			InputBg = Color3.fromRGB(12, 21, 33),
+			DropdownBg = Color3.fromRGB(16, 30, 46),
+			ModalBg = Color3.fromRGB(15, 28, 44),
+			TextPrimary = Color3.fromRGB(240, 249, 255),
+			TextSecondary = Color3.fromRGB(186, 230, 253),
+			TextMuted = Color3.fromRGB(125, 175, 210),
+			Accent = Color3.fromRGB(14, 165, 233),
+			AccentText = Color3.fromRGB(255, 255, 255),
+			Border = Color3.fromRGB(36, 68, 102),
+			BorderStrong = Color3.fromRGB(56, 105, 155),
+			Divider = Color3.fromRGB(28, 52, 80),
+			Success = Color3.fromRGB(16, 185, 129),
+			Warning = Color3.fromRGB(245, 158, 11),
+			Error = Color3.fromRGB(239, 68, 68),
+			Info = Color3.fromRGB(56, 189, 248),
+			CornerWindow = 14, CornerElement = 10, CornerSmall = 6,
+			WindowTransparency = 0.03, ElementTransparency = 0, AnimSpeed = 0.18,
+		},
+		SunsetAmber = {
+			Name = "SunsetAmber", Mode = "Dark",
+			WindowBg = Color3.fromRGB(22, 15, 10),
+			SidebarBg = Color3.fromRGB(28, 19, 13),
+			HeaderBg = Color3.fromRGB(33, 22, 15),
+			SectionBg = Color3.fromRGB(40, 27, 18),
+			ElementBg = Color3.fromRGB(48, 33, 22),
+			ElementBgHover = Color3.fromRGB(60, 42, 28),
+			ElementBgActive = Color3.fromRGB(74, 52, 34),
+			InputBg = Color3.fromRGB(24, 16, 11),
+			DropdownBg = Color3.fromRGB(32, 22, 15),
+			ModalBg = Color3.fromRGB(30, 20, 14),
+			TextPrimary = Color3.fromRGB(255, 251, 235),
+			TextSecondary = Color3.fromRGB(253, 230, 138),
+			TextMuted = Color3.fromRGB(195, 160, 115),
+			Accent = Color3.fromRGB(245, 158, 11),
+			AccentText = Color3.fromRGB(20, 14, 8),
+			Border = Color3.fromRGB(82, 56, 36),
+			BorderStrong = Color3.fromRGB(120, 82, 52),
+			Divider = Color3.fromRGB(64, 44, 28),
+			Success = Color3.fromRGB(16, 185, 129),
+			Warning = Color3.fromRGB(251, 191, 36),
+			Error = Color3.fromRGB(239, 68, 68),
+			Info = Color3.fromRGB(59, 130, 246),
+			CornerWindow = 14, CornerElement = 10, CornerSmall = 6,
+			WindowTransparency = 0.03, ElementTransparency = 0, AnimSpeed = 0.18,
+		},
+	},
+}
+
+function ThemeEngine:GetLuminance(c)
+	if typeof(c) ~= "Color3" then return 0 end
+	return 0.299 * c.R + 0.587 * c.G + 0.114 * c.B
+end
+
+function ThemeEngine:ContrastText(bg)
+	return self:GetLuminance(bg) > 0.58 and Color3.fromRGB(15, 23, 42) or Color3.fromRGB(248, 250, 252)
+end
+
+function ThemeEngine:GetToken(token)
+	local theme = self.Presets[self.Current] or self.Presets.ObsidianDark
+	if theme[token] ~= nil then return theme[token] end
+	return self.Presets.ObsidianDark[token]
+end
+
+function ThemeEngine:Bind(inst, propMap)
+	if not inst or type(propMap) ~= "table" then return inst end
+	self.BoundObjects[inst] = propMap
+	for prop, token in pairs(propMap) do
+		local val = self:GetToken(token)
+		if val ~= nil then
+			pcall(function() inst[prop] = val end)
+		end
+	end
+	return inst
+end
+
+function ThemeEngine:RegisterCustomTheme(name, tbl)
+	name = tostring(name or "CustomTheme")
+	local base = self.Presets.ObsidianDark
+	local merged = {}
+	for k, v in pairs(base) do
+		if tbl and tbl[k] ~= nil and typeof(tbl[k]) == typeof(v) then
+			merged[k] = tbl[k]
+		else
+			merged[k] = v
+		end
+	end
+	merged.Name = name
+	merged.AccentText = self:ContrastText(merged.Accent)
+	self.Presets[name] = merged
+	return merged
+end
+
+function ThemeEngine:SetTheme(themeNameOrTable, animate)
+	animate = animate ~= false
+	local target = self.Current
+	if type(themeNameOrTable) == "string" then
+		if self.Presets[themeNameOrTable] then
+			target = themeNameOrTable
+		else
+			local map = {
+				Dark = "ObsidianDark", Default = "ObsidianDark", Monochrome = "ObsidianDark",
+				Light = "AlabasterLight", Serenity = "AlabasterLight",
+				Green = "EmeraldMatrix", Plant = "EmeraldMatrix", Emerald = "EmeraldMatrix",
+				Red = "CrimsonForge", Crimson = "CrimsonForge", Rose = "CrimsonForge",
+				Amethyst = "AmethystRoyal", Violet = "AmethystRoyal",
+				Ocean = "MidnightOcean", Aqua = "MidnightOcean", DarkBlue = "MidnightOcean",
+				Amber = "SunsetAmber", AmberGlow = "SunsetAmber",
+			}
+			target = map[themeNameOrTable] or "ObsidianDark"
+		end
+	elseif type(themeNameOrTable) == "table" then
+		local cName = themeNameOrTable.Name or "CustomTheme"
+		self:RegisterCustomTheme(cName, themeNameOrTable)
+		target = cName
+	end
+
+	self.Current = target
+	local dur = self:GetToken("AnimSpeed") or 0.18
+
+	for inst, propMap in pairs(self.BoundObjects) do
+		if inst and inst.Parent then
+			local tweenTarget = {}
+			for prop, token in pairs(propMap) do
+				local val = self:GetToken(token)
+				if val ~= nil then
+					if animate and (typeof(val) == "Color3" or typeof(val) == "number") then
+						tweenTarget[prop] = val
+					else
+						pcall(function() inst[prop] = val end)
+					end
+				end
+			end
+			if next(tweenTarget) then
+				AnimationManager:Tween(inst, tweenTarget, dur)
+			end
+		else
+			self.BoundObjects[inst] = nil
+		end
+	end
+
+	for _, fn in ipairs(self.Listeners) do
+		task.spawn(pcall, fn, self.Presets[target])
+	end
+	return self.Presets[target]
+end
+
+-- ============================================================================
+-- MODULE 5: UNIFIED ICON MANAGER (OFFLINE ASSET REGISTRY + LRU CACHE)
+-- ============================================================================
+local IconManager = {
+	Fallback = "rbxassetid://10723415903",
+	Cache = {},
+	Assets = {
+		["home"] = "rbxassetid://10723407389",
+		["settings"] = "rbxassetid://10734950309",
+		["sliders"] = "rbxassetid://10734963400",
+		["search"] = "rbxassetid://10734943674",
+		["bell"] = "rbxassetid://10709775704",
+		["user"] = "rbxassetid://10747373176",
+		["users"] = "rbxassetid://10747373426",
+		["shield"] = "rbxassetid://10734951847",
+		["shield-check"] = "rbxassetid://10734951367",
+		["zap"] = "rbxassetid://130551565616516",
+		["terminal"] = "rbxassetid://10734982144",
+		["code"] = "rbxassetid://10709810463",
+		["copy"] = "rbxassetid://10709812159",
+		["check"] = "rbxassetid://10709790644",
+		["check-circle"] = "rbxassetid://10709790387",
+		["alert-triangle"] = "rbxassetid://10709753149",
+		["alert-circle"] = "rbxassetid://10709752996",
+		["info"] = "rbxassetid://10723415903",
+		["x"] = "rbxassetid://10747384394",
+		["x-circle"] = "rbxassetid://10747383819",
+		["minus"] = "rbxassetid://10734896206",
+		["plus"] = "rbxassetid://10734924532",
+		["maximize"] = "rbxassetid://10734886735",
+		["minimize"] = "rbxassetid://10734895698",
+		["chevron-down"] = "rbxassetid://10709790948",
+		["chevron-up"] = "rbxassetid://10709791523",
+		["chevron-right"] = "rbxassetid://10709791437",
+		["chevron-left"] = "rbxassetid://10709791281",
+		["palette"] = "rbxassetid://10734910430",
+		["keyboard"] = "rbxassetid://10723416765",
+		["key"] = "rbxassetid://10723416652",
+		["lock"] = "rbxassetid://10723434711",
+		["unlock"] = "rbxassetid://10747366027",
+		["eye"] = "rbxassetid://10723346959",
+		["eye-off"] = "rbxassetid://10723346871",
+		["folder"] = "rbxassetid://10723387563",
+		["save"] = "rbxassetid://10734941499",
+		["download"] = "rbxassetid://10723344270",
+		["upload"] = "rbxassetid://10747366434",
+		["refresh-cw"] = "rbxassetid://10734933222",
+		["trash"] = "rbxassetid://10747362393",
+		["external-link"] = "rbxassetid://10723346684",
+		["link"] = "rbxassetid://10723426722",
+		["image"] = "rbxassetid://10723415040",
+		["play"] = "rbxassetid://10734923549",
+		["pause"] = "rbxassetid://10734919336",
+		["activity"] = "rbxassetid://10709752035",
+		["cpu"] = "rbxassetid://10709813383",
+		["database"] = "rbxassetid://10709818996",
+		["globe"] = "rbxassetid://10723404337",
+		["layers"] = "rbxassetid://10723424505",
+		["layout"] = "rbxassetid://10723425376",
+		["moon"] = "rbxassetid://10734897102",
+		["sun"] = "rbxassetid://10734974297",
+		["sparkles"] = "rbxassetid://138635884129147",
+		["star"] = "rbxassetid://10734966248",
+		["gamepad"] = "rbxassetid://10723395457",
+		["crosshair"] = "rbxassetid://10709818534",
+		["compass"] = "rbxassetid://10709811445",
+		["volume-2"] = "rbxassetid://10747375679",
+		["volume-x"] = "rbxassetid://10747375880",
+		["list"] = "rbxassetid://10723433811",
+		["arrow-up"] = "rbxassetid://10709768939",
+		["arrow-down"] = "rbxassetid://10709767827",
+	},
+}
+
+function IconManager:AddIcons(map)
+	if type(map) ~= "table" then return end
+	for k, v in pairs(map) do
+		self.Assets[tostring(k):lower()] = v
+	end
+	self.Cache = {}
+end
+
+function IconManager:Resolve(icon)
+	if icon == nil or icon == "" or icon == false or icon == 0 then return nil end
+	local key = tostring(icon)
+	if self.Cache[key] then return self.Cache[key] end
+
+	local res = nil
+	if type(icon) == "number" then
+		res = { Image = "rbxassetid://" .. tostring(math.floor(icon)) }
+	elseif type(icon) == "string" then
+		if icon:match("^rbxassetid://") or icon:match("^rbxasset://") or icon:match("^rbxthumb://") then
+			res = { Image = icon }
+		elseif icon:match("^%d+$") then
+			res = { Image = "rbxassetid://" .. icon }
+		else
+			local norm = icon:lower():gsub("^lucide[:%-]", ""):gsub("[_%s]+", "-")
+			if self.Assets[norm] then
+				res = { Image = self.Assets[norm] }
+			end
+		end
+	end
+
+	if not res then
+		res = { Image = self.Fallback, IsFallback = true }
+	end
+	self.Cache[key] = res
+	return res
+end
+
+function IconManager:Apply(imgLabel, icon, colorToken)
+	local res = self:Resolve(icon)
+	if not res then
+		imgLabel.Visible = false
+		return false
+	end
+	imgLabel.Visible = true
+	imgLabel.Image = res.Image
+	if colorToken then
+		ThemeEngine:Bind(imgLabel, { ImageColor3 = colorToken })
+	end
+	return true
+end
+
+-- ============================================================================
+-- MODULE 6: LAYOUT & INSTANCE FACTORY
+-- ============================================================================
+local Factory = {}
+
+function Factory.GetSafeParent(customParent)
+	if typeof(customParent) == "Instance" then return customParent end
+	local okH, hui = pcall(function() return gethui and gethui() end)
+	if okH and hui then return hui end
+	local lp = Players.LocalPlayer
+	if lp then
+		local okP, pgui = pcall(function()
+			return lp:FindFirstChildOfClass("PlayerGui") or lp:WaitForChild("PlayerGui", 2)
+		end)
+		if okP and pgui then return pgui end
+	end
+	return game:GetService("CoreGui")
+end
+
+function Factory.Create(className, props, children)
+	local inst = Instance.new(className)
+	if className == "Frame" or className == "ScrollingFrame" or className == "CanvasGroup" then
+		inst.BorderSizePixel = 0
+	elseif className == "TextLabel" or className == "TextButton" or className == "TextBox" then
+		inst.BorderSizePixel = 0
+		inst.Font = Enum.Font.GothamMedium
+		inst.TextSize = 13
+		if className == "TextButton" then inst.AutoButtonColor = false end
+	elseif className == "ImageLabel" or className == "ImageButton" then
+		inst.BorderSizePixel = 0
+		inst.BackgroundTransparency = 1
+	end
+
+	local themeTag = nil
+	if props then
+		for k, v in pairs(props) do
+			if k == "ThemeTag" then
+				themeTag = v
+			elseif k ~= "Parent" then
+				inst[k] = v
+			end
+		end
+	end
+
+	if children then
+		for _, ch in ipairs(children) do
+			if typeof(ch) == "Instance" then
+				ch.Parent = inst
+			end
+		end
+	end
+
+	if themeTag then
+		ThemeEngine:Bind(inst, themeTag)
+	end
+
+	if props and props.Parent then
+		inst.Parent = props.Parent
+	end
+	return inst
+end
+
+function Factory.Corner(parent, radiusTokenOrPx)
+	local c = Instance.new("UICorner")
+	local px = type(radiusTokenOrPx) == "string" and ThemeEngine:GetToken(radiusTokenOrPx) or radiusTokenOrPx or 8
+	c.CornerRadius = UDim.new(0, px)
+	if parent then c.Parent = parent end
+	return c
+end
+
+function Factory.Stroke(parent, colorTokenOrColor, thickness, transparency)
+	local s = Instance.new("UIStroke")
+	s.Thickness = thickness or 1
+	s.Transparency = transparency or 0.4
+	s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	if type(colorTokenOrColor) == "string" then
+		ThemeEngine:Bind(s, { Color = colorTokenOrColor })
+	elseif typeof(colorTokenOrColor) == "Color3" then
+		s.Color = colorTokenOrColor
+	end
+	if parent then s.Parent = parent end
+	return s
+end
+
+function Factory.Padding(parent, t, b, l, r)
+	local p = Instance.new("UIPadding")
+	p.PaddingTop = UDim.new(0, t or 8)
+	p.PaddingBottom = UDim.new(0, b or t or 8)
+	p.PaddingLeft = UDim.new(0, l or t or 8)
+	p.PaddingRight = UDim.new(0, r or l or t or 8)
+	if parent then p.Parent = parent end
+	return p
+end
+
+-- ============================================================================
+-- MODULE 7: STATE MANAGER & CONFIGURATION ENGINE
+-- ============================================================================
+local StateManager = {
+	Flags = {},
+	Options = {},
+	KeyCounts = {},
+	Version = 2,
+	AutoSave = false,
+	Adapter = {
+		_mem = {},
+		Write = function(self, profile, content)
+			self._mem[profile] = content
+			if type(writefile) == "function" then
+				pcall(function()
+					if type(isfolder) == "function" and type(makefolder) == "function" and not isfolder("UltraFusion_Configs") then
+						makefolder("UltraFusion_Configs")
+					end
+					writefile("UltraFusion_Configs/" .. tostring(profile) .. ".json", content)
+				end)
+			end
+			return true
+		end,
+		Read = function(self, profile)
+			if self._mem[profile] then return self._mem[profile] end
+			if type(isfile) == "function" and type(readfile) == "function" then
+				local p = "UltraFusion_Configs/" .. tostring(profile) .. ".json"
+				local ok, data = pcall(function()
+					if isfile(p) then return readfile(p) end
+					return nil
+				end)
+				if ok and data then return data end
+			end
+			return nil
+		end,
+		Exists = function(self, profile)
+			if self._mem[profile] ~= nil then return true end
+			if type(isfile) == "function" then
+				local ok, ex = pcall(isfile, "UltraFusion_Configs/" .. tostring(profile) .. ".json")
+				if ok and ex then return true end
+			end
+			return false
+		end,
+	},
+}
+
+function StateManager:GenerateStableId(tabName, elType, title, explicitFlag)
+	if type(explicitFlag) == "string" and explicitFlag ~= "" then
+		if self.Flags[explicitFlag] then
+			local c = (self.KeyCounts[explicitFlag] or 1) + 1
+			self.KeyCounts[explicitFlag] = c
+			return explicitFlag .. "_" .. tostring(c)
+		end
+		self.KeyCounts[explicitFlag] = 1
+		return explicitFlag
+	end
+	local base = string.format("%s::%s::%s", tostring(tabName or "Tab"), tostring(elType or "El"), tostring(title or "Item"))
+	local c = (self.KeyCounts[base] or 0) + 1
+	self.KeyCounts[base] = c
+	return c == 1 and base or (base .. "#" .. tostring(c))
+end
+
+function StateManager:Register(id, ctrl)
+	self.Flags[id] = ctrl
+	self.Options[id] = ctrl
+	return id
+end
+
+function StateManager:Unregister(id)
+	if id then
+		self.Flags[id] = nil
+		self.Options[id] = nil
+	end
+end
+
+function StateManager:ExportJSON(includeTheme)
+	local data = {
+		Version = self.Version,
+		Theme = includeTheme ~= false and ThemeEngine.Current or nil,
+		Elements = {},
+	}
+	for id, ctrl in pairs(self.Flags) do
+		if ctrl and ctrl.Saveable ~= false and type(ctrl.GetValue) == "function" then
+			local v = ctrl:GetValue()
+			if ctrl.Type == "ColorPicker" and typeof(v) == "Color3" then
+				data.Elements[id] = { __type = "Color3", Hex = v:ToHex(), Alpha = ctrl.Transparency or 0 }
+			elseif typeof(v) == "EnumItem" then
+				data.Elements[id] = { __type = "EnumItem", Name = v.Name }
+			else
+				data.Elements[id] = { __type = ctrl.Type, Value = v }
+			end
+		end
+	end
+	return HttpService:JSONEncode(data)
+end
+
+function StateManager:ImportJSON(jsonStr)
+	if type(jsonStr) ~= "string" or jsonStr == "" then
+		return false, "Empty JSON string"
+	end
+	local ok, decoded = pcall(function() return HttpService:JSONDecode(jsonStr) end)
+	if not ok or type(decoded) ~= "table" then
+		Diagnostics:Log("WARN", "StateManager", "Invalid JSON configuration ignored")
+		return false, "Malformed JSON"
+	end
+
+	if type(decoded.Theme) == "string" then
+		ThemeEngine:SetTheme(decoded.Theme)
+	end
+
+	local elements = type(decoded.Elements) == "table" and decoded.Elements or decoded
+	local restored = 0
+	for id, entry in pairs(elements) do
+		local ctrl = self.Flags[id]
+		if ctrl and not ctrl:IsDestroyed() and type(ctrl.SetValue) == "function" then
+			if ctrl.Type == "ColorPicker" and type(entry) == "table" and entry.Hex then
+				local okC, col = pcall(Color3.fromHex, entry.Hex)
+				if okC and col then
+					ctrl:SetValue(col, entry.Alpha or 0, true)
+					restored += 1
+				end
+			elseif type(entry) == "table" and entry.__type == "EnumItem" and entry.Name then
+				ctrl:SetValue(entry.Name, nil, true)
+				restored += 1
+			elseif type(entry) == "table" and entry.Value ~= nil then
+				ctrl:SetValue(entry.Value, true)
+				restored += 1
+			elseif type(entry) ~= "table" then
+				ctrl:SetValue(entry, true)
+				restored += 1
+			end
+		end
+	end
+	return true, restored
+end
+
+function StateManager:SaveConfiguration(profile)
+	return self.Adapter:Write(tostring(profile or "Default"), self:ExportJSON(true))
+end
+
+function StateManager:LoadConfiguration(profile)
+	local raw = self.Adapter:Read(tostring(profile or "Default"))
+	if not raw then return false, "Profile not found" end
+	return self:ImportJSON(raw)
+end
+
+-- ============================================================================
+-- MODULE 8: NOTIFICATION & MODAL DIALOG MANAGERS
+-- ============================================================================
+local NotificationManager = {
+	Holder = nil,
+	Active = {},
+	MaxStack = 5,
+	Order = 0,
+}
+
+function NotificationManager:Init(screenGui)
+	if self.Holder and self.Holder.Parent then return end
+	self.Holder = Factory.Create("Frame", {
+		Name = "UltraFusion_Toasts",
+		Size = UDim2.new(0, 320, 1, -32),
+		Position = UDim2.new(1, -16, 1, -16),
+		AnchorPoint = Vector2.new(1, 1),
+		BackgroundTransparency = 1,
+		Parent = screenGui,
+	}, {
+		Factory.Create("UIListLayout", {
+			Padding = UDim.new(0, 8),
+			HorizontalAlignment = Enum.HorizontalAlignment.Right,
+			VerticalAlignment = Enum.VerticalAlignment.Bottom,
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		}),
+	})
+end
+
+function NotificationManager:Notify(cfg)
+	cfg = type(cfg) == "table" and cfg or { Content = tostring(cfg) }
+	while #self.Active >= self.MaxStack do
+		local oldest = table.remove(self.Active, 1)
+		if oldest and oldest.Close then oldest:Close() end
+	end
+
+	local title = tostring(cfg.Title or cfg.Name or "Notification")
+	local body = tostring(cfg.Content or cfg.Text or cfg.Message or "")
+	local kind = tostring(cfg.Type or "Info"):lower()
+	local dur = tonumber(cfg.Duration or cfg.Time) or 4
+	local actions = type(cfg.Actions or cfg.Buttons) == "table" and (cfg.Actions or cfg.Buttons) or {}
+
+	local accentToken, defIcon = "Info", "info"
+	if kind == "success" then accentToken = "Success"; defIcon = "check-circle"
+	elseif kind == "warning" or kind == "warn" then accentToken = "Warning"; defIcon = "alert-triangle"
+	elseif kind == "error" or kind == "danger" then accentToken = "Error"; defIcon = "x-circle"
+	end
+
+	self.Order += 1
+	local maid = Lifecycle.new()
+	local toast = { Closed = false, Maid = maid }
+
+	local wrap = Factory.Create("Frame", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		LayoutOrder = self.Order,
+		Parent = self.Holder,
+	})
+	maid:Add(wrap)
+
+	local card = Factory.Create("Frame", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		Position = UDim2.new(1, 350, 0, 0),
+		ThemeTag = { BackgroundColor3 = "ModalBg" },
+		Parent = wrap,
+	}, {
+		Factory.Corner(nil, "CornerElement"),
+		Factory.Stroke(nil, accentToken, 1, 0.3),
+	})
+
+	local content = Factory.Create("Frame", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Parent = card,
+	}, {
+		Factory.Padding(nil, 11, 13, 13, 13),
+		Factory.Create("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }),
+	})
+
+	local topRow = Factory.Create("Frame", {
+		Size = UDim2.new(1, 0, 0, 18),
+		BackgroundTransparency = 1,
+		LayoutOrder = 1,
+		Parent = content,
+	})
+
+	local ico = Factory.Create("ImageLabel", {
+		Size = UDim2.fromOffset(16, 16),
+		Position = UDim2.fromScale(0, 0.5),
+		AnchorPoint = Vector2.new(0, 0.5),
+		Parent = topRow,
+	})
+	IconManager:Apply(ico, cfg.Icon or cfg.Image or defIcon, accentToken)
+
+	Factory.Create("TextLabel", {
+		Size = UDim2.new(1, -44, 1, 0),
+		Position = UDim2.fromOffset(22, 0),
+		BackgroundTransparency = 1,
+		Text = title,
+		Font = Enum.Font.GothamBold,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		ThemeTag = { TextColor3 = "TextPrimary" },
+		Parent = topRow,
+	})
+
+	local closeBtn = Factory.Create("TextButton", {
+		Size = UDim2.fromOffset(18, 18),
+		Position = UDim2.fromScale(1, 0.5),
+		AnchorPoint = Vector2.new(1, 0.5),
+		BackgroundTransparency = 1,
+		Text = "×",
+		Font = Enum.Font.GothamBold,
+		TextSize = 15,
+		ThemeTag = { TextColor3 = "TextMuted" },
+		Parent = topRow,
+	})
+
+	if body ~= "" then
+		Factory.Create("TextLabel", {
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			Text = body,
+			Font = Enum.Font.Gotham,
+			TextSize = 12,
+			TextWrapped = true,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			ThemeTag = { TextColor3 = "TextSecondary" },
+			LayoutOrder = 2,
+			Parent = content,
+		})
+	end
+
+	if #actions > 0 then
+		local actRow = Factory.Create("Frame", {
+			Size = UDim2.new(1, 0, 0, 26),
+			BackgroundTransparency = 1,
+			LayoutOrder = 3,
+			Parent = content,
+		}, {
+			Factory.Create("UIListLayout", {
+				FillDirection = Enum.FillDirection.Horizontal,
+				Padding = UDim.new(0, 6),
+				HorizontalAlignment = Enum.HorizontalAlignment.Right,
+			}),
+		})
+		for _, a in ipairs(actions) do
+			local b = Factory.Create("TextButton", {
+				Size = UDim2.new(0, 0, 1, 0),
+				AutomaticSize = Enum.AutomaticSize.X,
+				Text = tostring(a.Title or a.Name or "Action"),
+				Font = Enum.Font.GothamBold,
+				TextSize = 11,
+				ThemeTag = { BackgroundColor3 = "ElementBgHover", TextColor3 = "TextPrimary" },
+				Parent = actRow,
+			}, {
+				Factory.Corner(nil, "CornerSmall"),
+				Factory.Padding(nil, 0, 0, 10, 10),
+			})
+			maid:Connect(b.MouseButton1Click, function()
+				Diagnostics:SafeCallback("ToastAction", a.Callback)
+				toast:Close()
+			end)
+		end
+	end
+
+	local bar = Factory.Create("Frame", {
+		Size = UDim2.new(1, 0, 0, 2),
+		Position = UDim2.fromScale(0, 1),
+		AnchorPoint = Vector2.new(0, 1),
+		ThemeTag = { BackgroundColor3 = accentToken },
+		Parent = card,
+	})
+
+	local paused, elapsed = false, 0
+	maid:Connect(card.MouseEnter, function() paused = true end)
+	maid:Connect(card.MouseLeave, function() paused = false end)
+	maid:Connect(closeBtn.MouseButton1Click, function() toast:Close() end)
+
+	function toast:Close()
+		if self.Closed then return end
+		self.Closed = true
+		local idx = table.find(NotificationManager.Active, self)
+		if idx then table.remove(NotificationManager.Active, idx) end
+		AnimationManager:Tween(card, { Position = UDim2.new(1, 350, 0, 0) }, 0.2, Enum.EasingStyle.Quint, Enum.EasingDirection.In, function()
+			maid:Destroy()
+		end)
+	end
+	toast.Destroy = toast.Close
+
+	table.insert(self.Active, toast)
+	AnimationManager:Tween(card, { Position = UDim2.fromOffset(0, 0) }, 0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+
+	if dur > 0 then
+		maid:Connect(RunService.Heartbeat, function(dt)
+			if not paused and not toast.Closed then
+				elapsed += dt
+				bar.Size = UDim2.new(math.clamp(1 - (elapsed / dur), 0, 1), 0, 0, 2)
+				if elapsed >= dur then toast:Close() end
+			end
+		end)
+	end
+	return toast
+end
+
+local ModalManager = { Active = nil }
+
+function ModalManager:Show(parent, cfg)
+	cfg = type(cfg) == "table" and cfg or { Content = tostring(cfg) }
+	if self.Active and not self.Active:IsDestroyed() then
+		self.Active:Destroy()
+	end
+
+	local maid = Lifecycle.new()
+	local modal = { Closed = false, Maid = maid }
+	self.Active = modal
+
+	local overlay = Factory.Create("TextButton", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = Color3.new(0, 0, 0),
+		BackgroundTransparency = 1,
+		Text = "",
+		ZIndex = 500,
+		Parent = parent,
+	}, { Factory.Corner(nil, "CornerWindow") })
+	maid:Add(overlay)
+
+	local scale = Factory.Create("UIScale", { Scale = 0.9 })
+	local box = Factory.Create("Frame", {
+		Size = UDim2.new(0, math.clamp(tonumber(cfg.Width) or 330, 250, 460), 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		Position = UDim2.fromScale(0.5, 0.5),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		ZIndex = 501,
+		ThemeTag = { BackgroundColor3 = "ModalBg" },
+		Parent = overlay,
+	}, {
+		scale,
+		Factory.Corner(nil, "CornerElement"),
+		Factory.Stroke(nil, "BorderStrong", 1, 0.2),
+		Factory.Padding(nil, 16, 16, 16, 16),
+		Factory.Create("UIListLayout", { Padding = UDim.new(0, 10), SortOrder = Enum.SortOrder.LayoutOrder }),
+	})
+
+	Factory.Create("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 20),
+		BackgroundTransparency = 1,
+		Text = tostring(cfg.Title or "Confirm Action"),
+		Font = Enum.Font.GothamBold,
+		TextSize = 15,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		ZIndex = 502,
+		LayoutOrder = 1,
+		ThemeTag = { TextColor3 = "TextPrimary" },
+		Parent = box,
+	})
+
+	local bodyText = tostring(cfg.Content or cfg.Text or cfg.Message or "")
+	if bodyText ~= "" then
+		Factory.Create("TextLabel", {
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			Text = bodyText,
+			Font = Enum.Font.Gotham,
+			TextSize = 12,
+			TextWrapped = true,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			ZIndex = 502,
+			LayoutOrder = 2,
+			ThemeTag = { TextColor3 = "TextSecondary" },
+			Parent = box,
+		})
+	end
+
+	local promptBox = nil
+	if cfg.Input or cfg.ShowInput then
+		promptBox = Factory.Create("TextBox", {
+			Size = UDim2.new(1, 0, 0, 32),
+			Text = tostring(cfg.DefaultInput or ""),
+			PlaceholderText = tostring(cfg.Placeholder or "Enter text..."),
+			Font = Enum.Font.Gotham,
+			TextSize = 12,
+			ClearTextOnFocus = false,
+			ZIndex = 502,
+			LayoutOrder = 3,
+			ThemeTag = { BackgroundColor3 = "InputBg", TextColor3 = "TextPrimary", PlaceholderColor3 = "TextMuted" },
+			Parent = box,
+		}, {
+			Factory.Corner(nil, "CornerSmall"),
+			Factory.Stroke(nil, "Border", 1, 0.3),
+			Factory.Padding(nil, 0, 0, 10, 10),
+		})
+	end
+
+	local btnRow = Factory.Create("Frame", {
+		Size = UDim2.new(1, 0, 0, 32),
+		BackgroundTransparency = 1,
+		ZIndex = 502,
+		LayoutOrder = 4,
+		Parent = box,
+	}, {
+		Factory.Create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal,
+			Padding = UDim.new(0, 8),
+			HorizontalAlignment = Enum.HorizontalAlignment.Right,
+		}),
+	})
+
+	local buttons = type(cfg.Buttons) == "table" and cfg.Buttons or {
+		{ Title = tostring(cfg.YesText or "Confirm"), Variant = "Primary", Callback = cfg.OnYes or cfg.Callback },
+		{ Title = tostring(cfg.NoText or "Cancel"), Variant = "Secondary", Callback = cfg.OnNo },
+	}
+
+	local clickedLock = false
+	function modal:Close()
+		if self.Closed then return end
+		self.Closed = true
+		AnimationManager:Tween(overlay, { BackgroundTransparency = 1 }, 0.15)
+		AnimationManager:Tween(scale, { Scale = 0.9 }, 0.15, Enum.EasingStyle.Quint, Enum.EasingDirection.In, function()
+			maid:Destroy()
+		end)
+	end
+	modal.Destroy = modal.Close
+	function modal:IsDestroyed() return maid:IsDestroyed() end
+
+	for idx, bCfg in ipairs(buttons) do
+		local primary = (bCfg.Variant == "Primary") or (idx == 1 and bCfg.Variant == nil)
+		local btn = Factory.Create("TextButton", {
+			Size = UDim2.new(1 / math.max(#buttons, 1), -5, 1, 0),
+			Text = tostring(bCfg.Title or bCfg.Name or "Button"),
+			Font = Enum.Font.GothamBold,
+			TextSize = 12,
+			ZIndex = 503,
+			ThemeTag = {
+				BackgroundColor3 = primary and "Accent" or "ElementBg",
+				TextColor3 = primary and "AccentText" or "TextPrimary",
+			},
+			Parent = btnRow,
+		}, {
+			Factory.Corner(nil, "CornerSmall"),
+			Factory.Stroke(nil, primary and "Accent" or "Border", 1, 0.35),
+		})
+
+		maid:Connect(btn.MouseButton1Click, function()
+			if clickedLock or modal.Closed then return end
+			clickedLock = true
+			local val = promptBox and promptBox.Text or nil
+			Diagnostics:SafeCallback("DialogButton", bCfg.Callback, nil, val)
+			modal:Close()
+		end)
+	end
+
+	AnimationManager:Tween(overlay, { BackgroundTransparency = 0.55 }, 0.18)
+	AnimationManager:Tween(scale, { Scale = 1 }, 0.22, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+	return modal
+end
+
+-- ============================================================================
+-- MODULE 9: COMPONENT REGISTRY & BASE ELEMENT CARD
+-- ============================================================================
+local ComponentRegistry = { Builders = {} }
+
+function ComponentRegistry:Register(name, fn)
+	self.Builders[name:lower()] = fn
+end
+
+function ComponentRegistry:CreateBaseCard(tab, cfg, hoverEnabled)
+	local maid = Lifecycle.new()
+	tab.Maid:Add(maid)
+
+	local title = tostring(cfg.Title or cfg.Name or "Element")
+	local desc = cfg.Description or cfg.Desc or cfg.Content or nil
+	local hasDesc = type(desc) == "string" and desc ~= ""
+
+	local root = Factory.Create("Frame", {
+		Name = "Element_" .. title,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		ThemeTag = { BackgroundColor3 = "ElementBg", BackgroundTransparency = "ElementTransparency" },
+		Parent = cfg.ParentContainer or tab.Container,
+	}, { Factory.Corner(nil, "CornerElement") })
+	maid:Add(root)
+
+	local stroke = Factory.Stroke(root, "Border", 1, 0.45)
+
+	local content = Factory.Create("Frame", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Parent = root,
+	}, { Factory.Padding(nil, 10, 10, 12, 12) })
+
+	local stack = Factory.Create("Frame", {
+		Size = UDim2.new(1, -(tonumber(cfg.RightReservedWidth) or 0), 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Parent = content,
+	}, {
+		Factory.Create("UIListLayout", { Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder }),
+	})
+
+	local titleLbl = Factory.Create("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 16),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Text = title,
+		Font = Enum.Font.GothamSemibold,
+		TextSize = 13,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		LayoutOrder = 1,
+		ThemeTag = { TextColor3 = "TextPrimary" },
+		Parent = stack,
+	})
+
+	local descLbl = Factory.Create("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 14),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Text = hasDesc and tostring(desc) or "",
+		Visible = hasDesc,
+		Font = Enum.Font.Gotham,
+		TextSize = 11,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		LayoutOrder = 2,
+		ThemeTag = { TextColor3 = "TextSecondary" },
+		Parent = stack,
+	})
+
+	local lockOverlay = Factory.Create("TextButton", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = Color3.fromRGB(10, 12, 18),
+		BackgroundTransparency = 0.35,
+		Text = "",
+		Visible = false,
+		ZIndex = 20,
+		Parent = root,
+	}, { Factory.Corner(nil, "CornerElement") })
+
+	local lockText = Factory.Create("TextLabel", {
+		Size = UDim2.new(1, -20, 1, 0),
+		Position = UDim2.fromOffset(10, 0),
+		BackgroundTransparency = 1,
+		Text = "Locked",
+		Font = Enum.Font.GothamBold,
+		TextSize = 12,
+		ZIndex = 21,
+		ThemeTag = { TextColor3 = "Warning" },
+		Parent = lockOverlay,
+	})
+
+	local ctrl = {
+		Type = cfg.Type or "Element",
+		Title = title,
+		Description = desc,
+		Enabled = cfg.Enabled ~= false and not cfg.Locked,
+		Visible = cfg.Visible ~= false,
+		Locked = cfg.Locked == true,
+		Saveable = cfg.Save ~= false,
+		Root = root,
+		Content = content,
+		TextStack = stack,
+		TitleLabel = titleLbl,
+		DescLabel = descLbl,
+		Stroke = stroke,
+		Maid = maid,
+		Listeners = {},
+	}
+
+	if hoverEnabled then
+		maid:Connect(root.MouseEnter, function()
+			if ctrl.Enabled and not ctrl.Locked then
+				AnimationManager:Tween(root, { BackgroundColor3 = ThemeEngine:GetToken("ElementBgHover") }, 0.14)
+			end
+		end)
+		maid:Connect(root.MouseLeave, function()
+			if ctrl.Enabled and not ctrl.Locked then
+				AnimationManager:Tween(root, { BackgroundColor3 = ThemeEngine:GetToken("ElementBg") }, 0.14)
+			end
+		end)
+	end
+
+	function ctrl:FlashError(err)
+		titleLbl.Text = tostring(self.Title) .. " — Callback Error"
+		AnimationManager:Tween(root, { BackgroundColor3 = ThemeEngine:GetToken("Error") }, 0.16)
+		task.delay(0.85, function()
+			if not maid:IsDestroyed() and root.Parent then
+				titleLbl.Text = self.Title
+				AnimationManager:Tween(root, { BackgroundColor3 = ThemeEngine:GetToken("ElementBg") }, 0.22)
+			end
+		end)
+	end
+
+	function ctrl:Highlight()
+		if maid:IsDestroyed() or not stroke.Parent then return end
+		AnimationManager:Tween(stroke, { Color = ThemeEngine:GetToken("Accent"), Thickness = 2, Transparency = 0 }, 0.16)
+		task.delay(0.8, function()
+			if not maid:IsDestroyed() and stroke.Parent then
+				AnimationManager:Tween(stroke, { Color = ThemeEngine:GetToken("Border"), Thickness = 1, Transparency = 0.45 }, 0.25)
+			end
+		end)
+	end
+
+	function ctrl:SetTitle(t)
+		self.Title = tostring(t or "")
+		titleLbl.Text = self.Title
+		return self
+	end
+
+	function ctrl:SetDescription(d)
+		self.Description = d
+		if d == nil or d == "" then
+			descLbl.Visible = false
+			descLbl.Text = ""
+		else
+			descLbl.Visible = true
+			descLbl.Text = tostring(d)
+		end
+		return self
+	end
+	ctrl.SetDesc = ctrl.SetDescription
+
+	function ctrl:SetVisible(v)
+		self.Visible = v == true
+		root.Visible = self.Visible
+		return self
+	end
+
+	function ctrl:SetEnabled(en, reason)
+		self.Enabled = en == true
+		self.Locked = not self.Enabled
+		lockOverlay.Visible = self.Locked
+		lockText.Text = reason and ("Locked: " .. tostring(reason)) or "Disabled"
+		return self
+	end
+
+	function ctrl:Lock(reason) return self:SetEnabled(false, reason or "Locked") end
+	function ctrl:Unlock() return self:SetEnabled(true) end
+
+	function ctrl:OnChanged(fn)
+		if type(fn) == "function" then table.insert(self.Listeners, fn) end
+		return self
+	end
+
+	function ctrl:_fireChanged(val, silent)
+		if silent then return end
+		for _, fn in ipairs(self.Listeners) do
+			Diagnostics:SafeCallback(self.Title .. ":OnChanged", fn, function(e) self:FlashError(e) end, val)
+		end
+		if type(cfg.Callback) == "function" then
+			local runCb = function()
+				Diagnostics:SafeCallback(self.Title .. ":Callback", cfg.Callback, function(e) self:FlashError(e) end, val)
+				if cfg.Notify then
+					local n = type(cfg.Notify) == "table" and cfg.Notify or { Content = tostring(cfg.Notify) }
+					NotificationManager:Notify(n)
+				end
+			end
+			if cfg.Confirm and tab.Window then
+				local c = type(cfg.Confirm) == "table" and cfg.Confirm or { Content = tostring(cfg.Confirm) }
+				ModalManager:Show(tab.Window.RootFrame, {
+					Title = c.Title or "Confirm",
+					Content = c.Content or "Proceed with this action?",
+					OnYes = runCb,
+				})
+			else
+				runCb()
+			end
+		end
+		if StateManager.AutoSave then
+			StateManager:SaveConfiguration()
+		end
+	end
+
+	function ctrl:IsDestroyed() return maid:IsDestroyed() end
+	function ctrl:Destroy()
+		if maid:IsDestroyed() then return false end
+		StateManager:Unregister(self.Flag)
+		return maid:Destroy()
+	end
+
+	local id = StateManager:GenerateStableId(tab.Title, ctrl.Type, title, cfg.Flag or cfg.Idx)
+	ctrl.Flag = id
+	StateManager:Register(id, ctrl)
+	tab:RegisterElement(ctrl)
+
+	if ctrl.Locked then ctrl:Lock(cfg.LockedTitle or "Locked") end
+	return ctrl
+end
+
+-- ============================================================================
+-- MODULE 10: ALL 30 BASIC & ADVANCED UI ELEMENTS
+-- ============================================================================
+
+-- 1 & 2. BUTTON & ICON BUTTON
+ComponentRegistry:Register("button", function(tab, cfg)
+	cfg = type(cfg) == "table" and cfg or { Title = tostring(cfg) }
+	cfg.Type = "Button"
+	cfg.RightReservedWidth = 30
+	local ctrl = ComponentRegistry:CreateBaseCard(tab, cfg, true)
+
+	local ico = Factory.Create("ImageLabel", {
+		Size = UDim2.fromOffset(16, 16),
+		Position = UDim2.fromScale(1, 0.5),
+		AnchorPoint = Vector2.new(1, 0.5),
+		Parent = ctrl.Content,
+	})
+	IconManager:Apply(ico, cfg.Icon or "chevron-right", "TextSecondary")
+
+	local hit = Factory.Create("TextButton", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Text = "",
+		Parent = ctrl.Root,
+	})
+
+	ctrl.Maid:Connect(hit.MouseButton1Click, function()
+		if not ctrl.Enabled or ctrl.Locked or tab.IsScrolling then return end
+		AnimationManager:Tween(ctrl.Root, { BackgroundColor3 = ThemeEngine:GetToken("ElementBgActive") }, 0.08, nil, nil, function()
+			AnimationManager:Tween(ctrl.Root, { BackgroundColor3 = ThemeEngine:GetToken("ElementBg") }, 0.14)
+		end)
+		ctrl:_fireChanged(true, false)
+	end)
+
+	ctrl.Fire = function(self) self:_fireChanged(true, false) return self end
+	ctrl.Set = function(self, t) return self:SetTitle(t) end
+	return ctrl
+end)
+
+ComponentRegistry:Register("iconbutton", function(tab, cfg)
+	cfg = type(cfg) == "table" and cfg or { Title = "IconButton", Icon = "zap" }
+	return ComponentRegistry.Builders["button"](tab, cfg)
+end)
+
+-- 3. TOGGLE / SWITCH / CHECKBOX
+ComponentRegistry:Register("toggle", function(tab, cfg)
+	cfg = type(cfg) == "table" and cfg or { Title = tostring(cfg) }
+	cfg.Type = "Toggle"
+	cfg.RightReservedWidth = 54
+	local ctrl = ComponentRegistry:CreateBaseCard(tab, cfg, true)
+	local init = (cfg.Default ~= nil and cfg.Default) or (cfg.CurrentValue ~= nil and cfg.CurrentValue) or (cfg.Value ~= nil and cfg.Value) or false
+	ctrl.Value = init == true
+
+	local track = Factory.Create("Frame", {
+		Size = UDim2.fromOffset(40, 20),
+		Position = UDim2.fromScale(1, 0.5),
+		AnchorPoint = Vector2.new(1, 0.5),
+		ThemeTag = { BackgroundColor3 = ctrl.Value and "Accent" or "InputBg" },
+		Parent = ctrl.Content,
+	}, {
+		Factory.Corner(nil, 99),
+		Factory.Stroke(nil, ctrl.Value and "Accent" or "Border", 1, 0.3),
+	})
+
+	local knob = Factory.Create("Frame", {
+		Size = UDim2.fromOffset(14, 14),
+		Position = ctrl.Value and UDim2.new(1, -17, 0.5, 0) or UDim2.new(0, 3, 0.5, 0),
+		AnchorPoint = Vector2.new(0, 0.5),
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		Parent = track,
+	}, { Factory.Corner(nil, 99) })
+
+	local hit = Factory.Create("TextButton", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Text = "",
+		Parent = ctrl.Root,
+	})
+
+	function ctrl:SetValue(v, silent)
+		local b = v == true
+		self.Value = b
+		self.CurrentValue = b
+		ThemeEngine:Bind(track, { BackgroundColor3 = b and "Accent" or "InputBg" })
+		AnimationManager:Tween(track, { BackgroundColor3 = ThemeEngine:GetToken(b and "Accent" or "InputBg") }, 0.16)
+		AnimationManager:Tween(knob, { Position = b and UDim2.new(1, -17, 0.5, 0) or UDim2.new(0, 3, 0.5, 0) }, 0.16)
+		self:_fireChanged(b, silent)
+		return self
+	end
+	ctrl.Set = ctrl.SetValue
+	ctrl.GetValue = function(self) return self.Value end
+	ctrl.GetState = ctrl.GetValue
+
+	ctrl.Maid:Connect(hit.MouseButton1Click, function()
+		if not ctrl.Enabled or ctrl.Locked or tab.IsScrolling then return end
+		ctrl:SetValue(not ctrl.Value, false)
+	end)
+
+	return ctrl
+end)
+
+-- 4 & 5. SLIDER & SLIDER WITH NUMERIC INPUT
+ComponentRegistry:Register("slider", function(tab, cfg)
+	cfg = type(cfg) == "table" and cfg or { Title = tostring(cfg) }
+	cfg.Type = "Slider"
+	local rng = type(cfg.Range) == "table" and cfg.Range or nil
+	local vTbl = type(cfg.Value) == "table" and cfg.Value or nil
+
+	local minV = tonumber(cfg.Min or (rng and rng[1]) or (vTbl and vTbl.Min)) or 0
+	local maxV = tonumber(cfg.Max or (rng and rng[2]) or (vTbl and vTbl.Max)) or 100
+	if minV > maxV then minV, maxV = maxV, minV end
+	local step = tonumber(cfg.Increment or cfg.Step or cfg.Rounding) or 1
+	if step <= 0 then step = 1 end
+	local suffix = cfg.Suffix or cfg.ValueName or ""
+	local hasBox = cfg.ShowInput == true or cfg.IsTextbox == true
+
+	local defV = tonumber(cfg.Default or cfg.CurrentValue or (vTbl and vTbl.Default) or (type(cfg.Value) == "number" and cfg.Value)) or minV
+	local ctrl = ComponentRegistry:CreateBaseCard(tab, cfg, false)
+
+	local function snap(n)
+		n = math.clamp(tonumber(n) or minV, minV, maxV)
+		local s = math.floor(((n - minV) / step) + 0.5) * step + minV
+		return tonumber(string.format("%.4f", math.clamp(s, minV, maxV))) or minV
+	end
+
+	ctrl.Value = snap(defV)
+	ctrl.Min = minV
+	ctrl.Max = maxV
+	ctrl.Step = step
+
+	local valDisplay
+	if hasBox then
+		valDisplay = Factory.Create("TextBox", {
+			Size = UDim2.fromOffset(62, 22),
+			Position = UDim2.new(1, 0, 0, 0),
+			AnchorPoint = Vector2.new(1, 0),
+			Text = tostring(ctrl.Value),
+			Font = Enum.Font.Code,
+			TextSize = 11,
+			ClearTextOnFocus = false,
+			ThemeTag = { BackgroundColor3 = "InputBg", TextColor3 = "TextPrimary" },
+			Parent = ctrl.Content,
+		}, {
+			Factory.Corner(nil, "CornerSmall"),
+			Factory.Stroke(nil, "Border", 1, 0.35),
+		})
+	else
+		valDisplay = Factory.Create("TextLabel", {
+			Size = UDim2.fromOffset(88, 18),
+			Position = UDim2.new(1, 0, 0, 0),
+			AnchorPoint = Vector2.new(1, 0),
+			BackgroundTransparency = 1,
+			Text = suffix ~= "" and (tostring(ctrl.Value) .. " " .. suffix) or tostring(ctrl.Value),
+			Font = Enum.Font.Code,
+			TextSize = 11,
+			TextXAlignment = Enum.TextXAlignment.Right,
+			ThemeTag = { TextColor3 = "TextSecondary" },
+			Parent = ctrl.Content,
+		})
+	end
+
+	local railWrap = Factory.Create("Frame", {
+		Size = UDim2.new(1, 0, 0, 18),
+		BackgroundTransparency = 1,
+		LayoutOrder = 3,
+		Parent = ctrl.TextStack,
+	})
+
+	local rail = Factory.Create("Frame", {
+		Size = UDim2.new(1, 0, 0, 6),
+		Position = UDim2.fromScale(0, 0.5),
+		AnchorPoint = Vector2.new(0, 0.5),
+		ThemeTag = { BackgroundColor3 = "InputBg" },
+		Parent = railWrap,
+	}, { Factory.Corner(nil, 99) })
+
+	local r0 = (maxV > minV) and ((ctrl.Value - minV) / (maxV - minV)) or 0
+	local fill = Factory.Create("Frame", {
+		Size = UDim2.fromScale(r0, 1),
+		ThemeTag = { BackgroundColor3 = "Accent" },
+		Parent = rail,
+	}, { Factory.Corner(nil, 99) })
+
+	local thumb = Factory.Create("Frame", {
+		Size = UDim2.fromOffset(13, 13),
+		Position = UDim2.fromScale(r0, 0.5),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		Parent = rail,
+	}, {
+		Factory.Corner(nil, 99),
+		Factory.Stroke(nil, "Accent", 2, 0),
+	})
+
+	local hit = Factory.Create("TextButton", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Text = "",
+		Parent = railWrap,
+	})
+
+	function ctrl:SetValue(v, silent)
+		local c = snap(v)
+		local diff = (c ~= self.Value)
+		self.Value = c
+		self.CurrentValue = c
+		local r = (self.Max > self.Min) and math.clamp((c - self.Min) / (self.Max - self.Min), 0, 1) or 0
+		AnimationManager:Tween(fill, { Size = UDim2.fromScale(r, 1) }, 0.08)
+		AnimationManager:Tween(thumb, { Position = UDim2.fromScale(r, 0.5) }, 0.08)
+		valDisplay.Text = hasBox and tostring(c) or (suffix ~= "" and (tostring(c) .. " " .. suffix) or tostring(c))
+		if diff or not silent then
+			self:_fireChanged(c, silent)
+		end
+		return self
+	end
+	ctrl.Set = ctrl.SetValue
+	ctrl.GetValue = function(self) return self.Value end
+
+	local dragging = false
+	local function updateFromX(x)
+		local a = math.clamp((x - rail.AbsolutePosition.X) / math.max(rail.AbsoluteSize.X, 1), 0, 1)
+		ctrl:SetValue(ctrl.Min + (ctrl.Max - ctrl.Min) * a, false)
+	end
+
+	ctrl.Maid:Connect(hit.InputBegan, function(inp)
+		if not ctrl.Enabled or ctrl.Locked then return end
+		if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			if tab.Container then tab.Container.ScrollingEnabled = false end
+			updateFromX(inp.Position.X)
+		end
+	end)
+	ctrl.Maid:Connect(UserInputService.InputChanged, function(inp)
+		if dragging and (inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch) then
+			updateFromX(inp.Position.X)
+		end
+	end)
+	ctrl.Maid:Connect(UserInputService.InputEnded, function(inp)
+		if dragging and (inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch) then
+			dragging = false
+			if tab.Container then tab.Container.ScrollingEnabled = true end
+		end
+	end)
+
+	if hasBox then
+		ctrl.Maid:Connect(valDisplay.FocusLost, function()
+			local n = tonumber(valDisplay.Text)
+			if n then ctrl:SetValue(n, false) else valDisplay.Text = tostring(ctrl.Value) end
+		end)
+	end
+
+	return ctrl
+end)
+
+ComponentRegistry:Register("sliderinput", function(tab, cfg)
+	cfg = type(cfg) == "table" and cfg or {}
+	cfg.ShowInput = true
+	return ComponentRegistry.Builders["slider"](tab, cfg)
+end)
+
+-- 6 & 7. TEXT INPUT & MULTILINE TEXTBOX
+ComponentRegistry:Register("input", function(tab, cfg)
+	cfg = type(cfg) == "table" and cfg or { Title = tostring(cfg) }
+	cfg.Type = "Input"
+	local multi = cfg.Multiline == true or cfg.Type == "Textarea"
+	cfg.RightReservedWidth = multi and 0 or 160
+
+	local ctrl = ComponentRegistry:CreateBaseCard(tab, cfg, false)
+	ctrl.Value = tostring(cfg.Default or cfg.CurrentValue or cfg.Value or "")
+
+	local holder = Factory.Create("Frame", {
+		Size = multi and UDim2.new(1, 0, 0, 72) or UDim2.fromOffset(150, 28),
+		Position = multi and UDim2.fromScale(0, 0) or UDim2.fromScale(1, 0.5),
+		AnchorPoint = multi and Vector2.new(0, 0) or Vector2.new(1, 0.5),
+		LayoutOrder = multi and 3 or 1,
+		ThemeTag = { BackgroundColor3 = "InputBg" },
+		Parent = multi and ctrl.TextStack or ctrl.Content,
+	}, {
+		Factory.Corner(nil, "CornerSmall"),
+		Factory.Stroke(nil, "Border", 1, 0.35),
+		Factory.Padding(nil, 5, 5, 8, 8),
+	})
+
+	local box = Factory.Create("TextBox", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Text = ctrl.Value,
+		PlaceholderText = tostring(cfg.Placeholder or cfg.PlaceholderText or "Enter text..."),
+		Font = Enum.Font.Gotham,
+		TextSize = 12,
+		TextWrapped = multi,
+		MultiLine = multi,
+		ClearTextOnFocus = cfg.ClearTextOnFocus == true or cfg.TextDisappear == true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = multi and Enum.TextYAlignment.Top or Enum.TextYAlignment.Center,
+		ThemeTag = { TextColor3 = "TextPrimary", PlaceholderColor3 = "TextMuted" },
+		Parent = holder,
+	})
+
+	function ctrl:SetValue(txt, silent)
+		local s = tostring(txt or "")
+		if cfg.Numeric and s ~= "" and not tonumber(s) then s = self.Value end
+		self.Value = s
+		self.CurrentValue = s
+		box.Text = s
+		self:_fireChanged(s, silent)
+		return self
+	end
+	ctrl.Set = ctrl.SetValue
+	ctrl.GetValue = function(self) return self.Value end
+
+	ctrl.Maid:Connect(box.FocusLost, function()
+		ctrl:SetValue(box.Text, false)
+		if cfg.RemoveTextAfterFocusLost or cfg.TextDisappear then box.Text = "" end
+	end)
+
+	return ctrl
+end)
+
+ComponentRegistry:Register("textbox", function(tab, cfg)
+	cfg = type(cfg) == "table" and cfg or {}
+	cfg.Multiline = true
+	return ComponentRegistry.Builders["input"](tab, cfg)
+end)
+
+-- 8, 9 & 10. DROPDOWN (SINGLE, MULTI-SELECT & SEARCHABLE)
+ComponentRegistry:Register("dropdown", function(tab, cfg)
+	cfg = type(cfg) == "table" and cfg or { Title = tostring(cfg) }
+	cfg.Type = "Dropdown"
+	local isMulti = cfg.Multi == true or cfg.MultipleOptions == true
+	local isSearch = cfg.Searchable ~= false
+	local opts = type(cfg.Options or cfg.Values) == "table" and table.clone(cfg.Options or cfg.Values) or {}
+
+	local ctrl = ComponentRegistry:CreateBaseCard(tab, cfg, false)
+	ctrl.Options = opts
+	ctrl.Multi = isMulti
+	ctrl.Opened = false
+
+	local def = cfg.Default or cfg.CurrentOption or cfg.Value
+	if isMulti then
+		ctrl.Value = {}
+		if type(def) == "table" then
+			for k, v in pairs(def) do
+				if type(k) == "number" and type(v) == "string" then table.insert(ctrl.Value, v)
+				elseif v == true and type(k) == "string" then table.insert(ctrl.Value, k) end
+			end
+		elseif type(def) == "string" and def ~= "" then
+			table.insert(ctrl.Value, def)
+		end
+	else
+		ctrl.Value = type(def) == "table" and def[1] or def or opts[1]
+	end
+
+	local function summary()
+		if isMulti then return #ctrl.Value == 0 and "None" or table.concat(ctrl.Value, ", ") end
+		return ctrl.Value ~= nil and tostring(ctrl.Value) or "Select..."
+	end
+
+	local trig = Factory.Create("TextButton", {
+		Size = UDim2.fromOffset(150, 28),
+		Position = UDim2.new(1, 0, 0, 0),
+		AnchorPoint = Vector2.new(1, 0),
+		Text = "",
+		ThemeTag = { BackgroundColor3 = "InputBg" },
+		Parent = ctrl.Content,
+	}, {
+		Factory.Corner(nil, "CornerSmall"),
+		Factory.Stroke(nil, "Border", 1, 0.35),
+		Factory.Padding(nil, 0, 0, 8, 8),
+	})
+
+	local selLbl = Factory.Create("TextLabel", {
+		Size = UDim2.new(1, -18, 1, 0),
+		BackgroundTransparency = 1,
+		Text = summary(),
+		Font = Enum.Font.GothamMedium,
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		ThemeTag = { TextColor3 = "TextPrimary" },
+		Parent = trig,
+	})
+
+	local chev = Factory.Create("ImageLabel", {
+		Size = UDim2.fromOffset(14, 14),
+		Position = UDim2.fromScale(1, 0.5),
+		AnchorPoint = Vector2.new(1, 0.5),
+		Parent = trig,
+	})
+	IconManager:Apply(chev, "chevron-down", "TextMuted")
+
+	local drawer = Factory.Create("Frame", {
+		Size = UDim2.new(1, 0, 0, 0),
+		BackgroundTransparency = 1,
+		ClipsDescendants = true,
+		Visible = false,
+		LayoutOrder = 4,
+		Parent = ctrl.TextStack,
+	})
+
+	local sBox = nil
+	if isSearch then
+		sBox = Factory.Create("TextBox", {
+			Size = UDim2.new(1, 0, 0, 26),
+			Position = UDim2.fromOffset(0, 6),
+			Text = "",
+			PlaceholderText = "Search options...",
+			Font = Enum.Font.Gotham,
+			TextSize = 11,
+			ClearTextOnFocus = false,
+			ThemeTag = { BackgroundColor3 = "InputBg", TextColor3 = "TextPrimary", PlaceholderColor3 = "TextMuted" },
+			Parent = drawer,
+		}, {
+			Factory.Corner(nil, "CornerSmall"),
+			Factory.Padding(nil, 0, 0, 8, 8),
+		})
+	end
+
+	local list = Factory.Create("ScrollingFrame", {
+		Size = UDim2.new(1, 0, 1, isSearch and -36 or -6),
+		Position = UDim2.fromOffset(0, isSearch and 36 or 6),
+		BackgroundTransparency = 1,
+		ScrollBarThickness = 2,
+		CanvasSize = UDim2.fromScale(0, 0),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ThemeTag = { ScrollBarImageColor3 = "Accent" },
+		Parent = drawer,
+	}, {
+		Factory.Create("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }),
+	})
+
+	local optBtns = {}
+	local function rebuild()
+		for _, b in ipairs(optBtns) do pcall(function() b:Destroy() end) end
+		table.clear(optBtns)
+		local q = sBox and sBox.Text:lower() or ""
+		for i, opt in ipairs(ctrl.Options) do
+			local str = tostring(opt)
+			if q == "" or str:lower():find(q, 1, true) then
+				local active = isMulti and (table.find(ctrl.Value, opt) ~= nil) or (ctrl.Value == opt)
+				local b = Factory.Create("TextButton", {
+					Size = UDim2.new(1, -4, 0, 26),
+					Text = str,
+					Font = active and Enum.Font.GothamBold or Enum.Font.Gotham,
+					TextSize = 11,
+					TextXAlignment = Enum.TextXAlignment.Left,
+					LayoutOrder = i,
+					ThemeTag = {
+						BackgroundColor3 = active and "Accent" or "InputBg",
+						TextColor3 = active and "AccentText" or "TextPrimary",
+					},
+					Parent = list,
+				}, {
+					Factory.Corner(nil, "CornerSmall"),
+					Factory.Padding(nil, 0, 0, 8, 8),
+				})
+				table.insert(optBtns, b)
+				ctrl.Maid:Connect(b.MouseButton1Click, function()
+					if isMulti then
+						local idx = table.find(ctrl.Value, opt)
+						if idx then table.remove(ctrl.Value, idx) else table.insert(ctrl.Value, opt) end
+						selLbl.Text = summary()
+						rebuild()
+						ctrl:_fireChanged(ctrl.Value, false)
+					else
+						ctrl:SetValue(opt, false)
+						ctrl:Toggle(false)
+					end
+				end)
+			end
+		end
+	end
+
+	function ctrl:Toggle(open)
+		if open == nil then open = not self.Opened end
+		self.Opened = open == true
+		if self.Opened then
+			rebuild()
+			drawer.Visible = true
+			local h = math.min(#self.Options * 30, 140) + (isSearch and 40 or 10)
+			AnimationManager:Tween(chev, { Rotation = 180 }, 0.16)
+			AnimationManager:Tween(drawer, { Size = UDim2.new(1, 0, 0, h) }, 0.18)
+		else
+			AnimationManager:Tween(chev, { Rotation = 0 }, 0.16)
+			AnimationManager:Tween(drawer, { Size = UDim2.new(1, 0, 0, 0) }, 0.16, nil, nil, function()
+				if not self.Opened then drawer.Visible = false end
+			end)
+		end
+	end
+
+	function ctrl:SetValue(v, silent)
+		if isMulti then
+			self.Value = type(v) == "table" and table.clone(v) or { tostring(v) }
+		else
+			self.Value = type(v) == "table" and v[1] or v
+		end
+		self.CurrentOption = self.Value
+		selLbl.Text = summary()
+		if self.Opened then rebuild() end
+		self:_fireChanged(self.Value, silent)
+		return self
+	end
+	ctrl.Set = ctrl.SetValue
+	ctrl.GetValue = function(self) return self.Value end
+	ctrl.Refresh = function(self, newOpts)
+		if type(newOpts) == "table" then self.Options = table.clone(newOpts) end
+		if self.Opened then rebuild() end
+		return self
+	end
+
+	ctrl.Maid:Connect(trig.MouseButton1Click, function()
+		if not ctrl.Enabled or ctrl.Locked or tab.IsScrolling then return end
+		ctrl:Toggle()
+	end)
+	if sBox then ctrl.Maid:Connect(sBox:GetPropertyChangedSignal("Text"), rebuild) end
+	return ctrl
+end)
+
+-- 11. COLOR PICKER (HSV + HUE + ALPHA + HEX + PALETTE)
+ComponentRegistry:Register("colorpicker", function(tab, cfg)
+	cfg = type(cfg) == "table" and cfg or { Title = tostring(cfg) }
+	cfg.Type = "ColorPicker"
+	local ctrl = ComponentRegistry:CreateBaseCard(tab, cfg, false)
+	local initC = cfg.Default or cfg.Color or cfg.Value or Color3.fromRGB(59, 130, 246)
+	if typeof(initC) ~= "Color3" then initC = Color3.fromRGB(59, 130, 246) end
+	local h, s, v = initC:ToHSV()
+
+	ctrl.Value = initC
+	ctrl.Color = initC
+	ctrl.Transparency = tonumber(cfg.Transparency) or 0
+	ctrl.Opened = false
+
+	local prev = Factory.Create("TextButton", {
+		Size = UDim2.fromOffset(44, 22),
+		Position = UDim2.new(1, 0, 0, 0),
+		AnchorPoint = Vector2.new(1, 0),
+		BackgroundColor3 = initC,
+		BackgroundTransparency = ctrl.Transparency,
+		Text = "",
+		Parent = ctrl.Content,
+	}, {
+		Factory.Corner(nil, "CornerSmall"),
+		Factory.Stroke(nil, "BorderStrong", 1, 0.2),
+	})
+
+	local drawer = Factory.Create("Frame", {
+		Size = UDim2.new(1, 0, 0, 0),
+		BackgroundTransparency = 1,
+		ClipsDescendants = true,
+		Visible = false,
+		LayoutOrder = 4,
+		Parent = ctrl.TextStack,
+	})
+
+	local svMap = Factory.Create("ImageButton", {
+		Size = UDim2.new(1, -85, 0, 100),
+		Position = UDim2.fromOffset(0, 6),
+		Image = "rbxassetid://4155801252",
+		BackgroundColor3 = Color3.fromHSV(h, 1, 1),
+		AutoButtonColor = false,
+		Parent = drawer,
+	}, {
+		Factory.Corner(nil, "CornerSmall"),
+		Factory.Stroke(nil, "Border", 1, 0.3),
+	})
+
+	local svDot = Factory.Create("Frame", {
+		Size = UDim2.fromOffset(10, 10),
+		Position = UDim2.fromScale(s, 1 - v),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		BackgroundColor3 = initC,
+		Parent = svMap,
+	}, {
+		Factory.Corner(nil, 99),
+		Factory.Stroke(nil, Color3.new(1, 1, 1), 2, 0),
+	})
+
+	local kps = {}
+	for i = 0, 1, 0.1 do table.insert(kps, ColorSequenceKeypoint.new(i, Color3.fromHSV(i, 1, 1))) end
+	local hueBar = Factory.Create("TextButton", {
+		Size = UDim2.fromOffset(12, 100),
+		Position = UDim2.new(1, -68, 0, 6),
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		Text = "",
+		Parent = drawer,
+	}, {
+		Factory.Corner(nil, 99),
+		Factory.Create("UIGradient", { Rotation = 90, Color = ColorSequence.new(kps) }),
+	})
+
+	local hueDot = Factory.Create("Frame", {
+		Size = UDim2.new(1, 4, 0, 5),
+		Position = UDim2.fromScale(0.5, h),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		Parent = hueBar,
+	}, { Factory.Corner(nil, 2) })
+
+	local hexInput = Factory.Create("TextBox", {
+		Size = UDim2.fromOffset(50, 24),
+		Position = UDim2.new(1, 0, 0, 6),
+		AnchorPoint = Vector2.new(1, 0),
+		Text = "#" .. initC:ToHex():upper(),
+		Font = Enum.Font.Code,
+		TextSize = 10,
+		ClearTextOnFocus = false,
+		ThemeTag = { BackgroundColor3 = "InputBg", TextColor3 = "TextPrimary" },
+		Parent = drawer,
+	}, {
+		Factory.Corner(nil, "CornerSmall"),
+		Factory.Stroke(nil, "Border", 1, 0.4),
+	})
+
+	local function updateUI()
+		local c = Color3.fromHSV(h, s, v)
+		ctrl.Value = c
+		ctrl.Color = c
+		prev.BackgroundColor3 = c
+		svMap.BackgroundColor3 = Color3.fromHSV(h, 1, 1)
+		svDot.Position = UDim2.fromScale(s, 1 - v)
+		svDot.BackgroundColor3 = c
+		hueDot.Position = UDim2.fromScale(0.5, h)
+		hexInput.Text = "#" .. c:ToHex():upper()
+	end
+
+	function ctrl:SetValue(col, alpha, silent)
+		if typeof(col) == "Color3" then
+			h, s, v = col:ToHSV()
+		elseif type(col) == "string" then
+			local ok, p = pcall(Color3.fromHex, col:gsub("#", ""))
+			if ok and p then h, s, v = p:ToHSV() end
+		end
+		if type(alpha) == "number" then self.Transparency = math.clamp(alpha, 0, 1) end
+		updateUI()
+		self:_fireChanged(self.Value, silent)
+		return self
+	end
+	ctrl.Set = ctrl.SetValue
+	ctrl.SetValueRGB = ctrl.SetValue
+	ctrl.GetValue = function(self) return self.Value, self.Transparency end
+
+	local mode = nil
+	ctrl.Maid:Connect(svMap.InputBegan, function(inp)
+		if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+			mode = "SV"
+			if tab.Container then tab.Container.ScrollingEnabled = false end
+		end
+	end)
+	ctrl.Maid:Connect(hueBar.InputBegan, function(inp)
+		if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+			mode = "HUE"
+			if tab.Container then tab.Container.ScrollingEnabled = false end
+		end
+	end)
+	ctrl.Maid:Connect(UserInputService.InputChanged, function(inp)
+		if not mode then return end
+		if inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch then
+			if mode == "SV" then
+				s = math.clamp((inp.Position.X - svMap.AbsolutePosition.X) / math.max(svMap.AbsoluteSize.X, 1), 0, 1)
+				v = 1 - math.clamp((inp.Position.Y - svMap.AbsolutePosition.Y) / math.max(svMap.AbsoluteSize.Y, 1), 0, 1)
+			elseif mode == "HUE" then
+				h = math.clamp((inp.Position.Y - hueBar.AbsolutePosition.Y) / math.max(hueBar.AbsoluteSize.Y, 1), 0, 1)
+			end
+			updateUI()
+			ctrl:_fireChanged(ctrl.Value, false)
+		end
+	end)
+	ctrl.Maid:Connect(UserInputService.InputEnded, function(inp)
+		if mode and (inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch) then
+			mode = nil
+			if tab.Container then tab.Container.ScrollingEnabled = true end
+		end
+	end)
+
+	ctrl.Maid:Connect(hexInput.FocusLost, function() ctrl:SetValue(hexInput.Text, ctrl.Transparency, false) end)
+	ctrl.Maid:Connect(prev.MouseButton1Click, function()
+		if not ctrl.Enabled or ctrl.Locked then return end
+		ctrl.Opened = not ctrl.Opened
+		if ctrl.Opened then
+			drawer.Visible = true
+			AnimationManager:Tween(drawer, { Size = UDim2.new(1, 0, 0, 114) }, 0.18)
+		else
+			AnimationManager:Tween(drawer, { Size = UDim2.new(1, 0, 0, 0) }, 0.16, nil, nil, function()
+				if not ctrl.Opened then drawer.Visible = false end
+			end)
+		end
+	end)
+
+	return ctrl
+end)
+
+-- 12. KEYBIND
+ComponentRegistry:Register("keybind", function(tab, cfg)
+	cfg = type(cfg) == "table" and cfg or { Title = tostring(cfg) }
+	cfg.Type = "Keybind"
+	cfg.RightReservedWidth = 86
+	local ctrl = ComponentRegistry:CreateBaseCard(tab, cfg, false)
+
+	local function normKey(k)
+		if typeof(k) == "EnumItem" then return k.Name end
+		if type(k) == "string" and k ~= "" then return k end
+		return "F"
+	end
+
+	ctrl.Value = normKey(cfg.Default or cfg.CurrentKeybind or cfg.Value)
+	ctrl.Mode = tostring(cfg.Mode or (cfg.Hold and "Hold") or "Toggle")
+	ctrl.Toggled = false
+	ctrl.Binding = false
+
+	local btn = Factory.Create("TextButton", {
+		Size = UDim2.new(0, 0, 0, 26),
+		AutomaticSize = Enum.AutomaticSize.X,
+		Position = UDim2.fromScale(1, 0.5),
+		AnchorPoint = Vector2.new(1, 0.5),
+		Text = ctrl.Value,
+		Font = Enum.Font.Code,
+		TextSize = 11,
+		ThemeTag = { BackgroundColor3 = "InputBg", TextColor3 = "TextPrimary" },
+		Parent = ctrl.Content,
+	}, {
+		Factory.Corner(nil, "CornerSmall"),
+		Factory.Stroke(nil, "Border", 1, 0.35),
+		Factory.Padding(nil, 0, 0, 10, 10),
+	})
+
+	function ctrl:SetValue(k, mode, silent)
+		self.Value = normKey(k)
+		if mode then self.Mode = tostring(mode) end
+		btn.Text = self.Value
+		if cfg.CallOnChange and not silent then self:_fireChanged(self.Value, false) end
+		return self
+	end
+	ctrl.Set = ctrl.SetValue
+	ctrl.GetValue = function(self) return self.Value end
+	ctrl.GetState = function(self) return self.Mode == "Always" or self.Toggled end
+
+	ctrl.Maid:Connect(btn.MouseButton1Click, function()
+		if not ctrl.Enabled or ctrl.Locked or ctrl.Binding then return end
+		ctrl.Binding = true
+		btn.Text = "..."
+	end)
+
+	ctrl.Maid:Connect(UserInputService.InputBegan, function(inp, gp)
+		if ctrl.Binding then
+			if inp.UserInputType == Enum.UserInputType.Keyboard and inp.KeyCode ~= Enum.KeyCode.Unknown then
+				ctrl.Binding = false
+				ctrl:SetValue(inp.KeyCode == Enum.KeyCode.Escape and "None" or inp.KeyCode.Name, nil, false)
+			end
+			return
+		end
+		if gp or UserInputService:GetFocusedTextBox() or not ctrl.Enabled or ctrl.Locked then return end
+		if inp.UserInputType == Enum.UserInputType.Keyboard and inp.KeyCode.Name == ctrl.Value then
+			if ctrl.Mode == "Hold" then
+				ctrl.Toggled = true
+				ctrl:_fireChanged(true, false)
+			else
+				ctrl.Toggled = not ctrl.Toggled
+				ctrl:_fireChanged(ctrl.Toggled, false)
+			end
+		end
+	end)
+
+	ctrl.Maid:Connect(UserInputService.InputEnded, function(inp)
+		if ctrl.Mode == "Hold" and ctrl.Toggled and inp.UserInputType == Enum.UserInputType.Keyboard and inp.KeyCode.Name == ctrl.Value then
+			ctrl.Toggled = false
+			ctrl:_fireChanged(false, false)
+		end
+	end)
+
+	return ctrl
+end)
+
+-- 13, 14, 15, 16, 17, 18, 19, 20+. SPECIALIZED & ADVANCED ELEMENTS
+ComponentRegistry:Register("label", function(tab, cfg)
+	cfg = type(cfg) == "table" and cfg or { Title = tostring(cfg) }
+	cfg.Type = "Label"; cfg.Save = false
+	local ctrl = ComponentRegistry:CreateBaseCard(tab, cfg, false)
+	ctrl.Set = ctrl.SetTitle
+	return ctrl
+end)
+
+ComponentRegistry:Register("paragraph", function(tab, cfg)
+	cfg = type(cfg) == "table" and cfg or { Title = tostring(cfg) }
+	cfg.Type = "Paragraph"; cfg.Save = false
+	local ctrl = ComponentRegistry:CreateBaseCard(tab, cfg, false)
+	ctrl.Set = function(self, d) return self:SetDescription(type(d) == "table" and (d.Content or d.Desc) or d) end
+	return ctrl
+end)
+
+ComponentRegistry:Register("divider", function(tab, cfg)
+	cfg = type(cfg) == "table" and cfg or {}
+	local maid = Lifecycle.new()
+	tab.Maid:Add(maid)
+	local f = Factory.Create("Frame", {
+		Size = UDim2.new(1, 0, 0, 12),
+		BackgroundTransparency = 1,
+		Parent = cfg.ParentContainer or tab.Container,
+	})
+	maid:Add(f)
+	Factory.Create("Frame", {
+		Size = UDim2.new(1, 0, 0, 1),
+		Position = UDim2.fromScale(0, 0.5),
+		ThemeTag = { BackgroundColor3 = "Divider" },
+		Parent = f,
+	})
+	return { Type = "Divider", Root = f, Destroy = function() return maid:Destroy() end, IsDestroyed = function() return maid:IsDestroyed() end }
+end)
+
+ComponentRegistry:Register("progressbar", function(tab, cfg)
+	cfg = type(cfg) == "table" and cfg or { Title = "Progress" }
+	cfg.Type = "ProgressBar"; cfg.Save = false
+	local minV, maxV = tonumber(cfg.Min) or 0, tonumber(cfg.Max) or 100
+	local curV = math.clamp(tonumber(cfg.Default or cfg.Value) or 0, minV, maxV)
+	local ctrl = ComponentRegistry:CreateBaseCard(tab, cfg, false)
+	ctrl.Value = curV
+
+	local pct = Factory.Create("TextLabel", {
+		Size = UDim2.fromOffset(55, 16),
+		Position = UDim2.new(1, 0, 0, 0),
+		AnchorPoint = Vector2.new(1, 0),
+		BackgroundTransparency = 1,
+		Text = string.format("%d%%", math.floor(((curV - minV) / math.max(maxV - minV, 1)) * 100 + 0.5)),
+		Font = Enum.Font.Code,
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		ThemeTag = { TextColor3 = "Accent" },
+		Parent = ctrl.Content,
+	})
+
+	local rail = Factory.Create("Frame", {
+		Size = UDim2.new(1, 0, 0, 6),
+		LayoutOrder = 3,
+		ThemeTag = { BackgroundColor3 = "InputBg" },
+		Parent = ctrl.TextStack,
+	}, { Factory.Corner(nil, 99) })
+
+	local fill = Factory.Create("Frame", {
+		Size = UDim2.fromScale((curV - minV) / math.max(maxV - minV, 1), 1),
+		ThemeTag = { BackgroundColor3 = "Accent" },
+		Parent = rail,
+	}, { Factory.Corner(nil, 99) })
+
+	function ctrl:SetValue(v)
+		self.Value = math.clamp(tonumber(v) or minV, minV, maxV)
+		local r = (self.Value - minV) / math.max(maxV - minV, 1)
+		pct.Text = string.format("%d%%", math.floor(r * 100 + 0.5))
+		AnimationManager:Tween(fill, { Size = UDim2.fromScale(r, 1) }, 0.18)
+		return self
+	end
+	ctrl.Set = ctrl.SetValue
+	ctrl.GetValue = function(self) return self.Value end
+	return ctrl
+end)
+
+ComponentRegistry:Register("code", function(tab, cfg)
+	cfg = type(cfg) == "table" and cfg or { Code = tostring(cfg) }
+	cfg.Type = "Code"; cfg.Save = false; cfg.Title = cfg.Title or "Code Snippet"
+	local ctrl = ComponentRegistry:CreateBaseCard(tab, cfg, false)
+	ctrl.Value = tostring(cfg.Code or cfg.Content or "")
+
+	local copyBtn = Factory.Create("TextButton", {
+		Size = UDim2.fromOffset(54, 22),
+		Position = UDim2.new(1, 0, 0, 0),
+		AnchorPoint = Vector2.new(1, 0),
+		Text = "Copy",
+		Font = Enum.Font.GothamBold,
+		TextSize = 10,
+		ThemeTag = { BackgroundColor3 = "InputBg", TextColor3 = "TextPrimary" },
+		Parent = ctrl.Content,
+	}, {
+		Factory.Corner(nil, "CornerSmall"),
+		Factory.Stroke(nil, "Border", 1, 0.35),
+	})
+
+	local codeLbl = Factory.Create("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		Text = ctrl.Value,
+		Font = Enum.Font.Code,
+		TextSize = 11,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		LayoutOrder = 3,
+		ThemeTag = { BackgroundColor3 = "InputBg", TextColor3 = "Accent" },
+		Parent = ctrl.TextStack,
+	}, {
+		Factory.Corner(nil, "CornerSmall"),
+		Factory.Padding(nil, 8, 8, 10, 10),
+	})
+
+	ctrl.Maid:Connect(copyBtn.MouseButton1Click, function()
+		pcall(function() if setclipboard then setclipboard(ctrl.Value) end end)
+		copyBtn.Text = "Copied"
+		task.delay(1.1, function() if not ctrl:IsDestroyed() then copyBtn.Text = "Copy" end end)
+	end)
+
+	ctrl.SetCode = function(self, c) self.Value = tostring(c or "") codeLbl.Text = self.Value return self end
+	ctrl.Set = ctrl.SetCode
+	return ctrl
+end)
+
+ComponentRegistry:Register("linkbutton", function(tab, cfg)
+	cfg = type(cfg) == "table" and cfg or { Title = "Copy Link", Link = tostring(cfg) }
+	local url = tostring(cfg.Link or cfg.Url or "https://roblox.com")
+	cfg.Description = cfg.Description or url
+	cfg.Icon = cfg.Icon or "external-link"
+	local origCb = cfg.Callback
+	cfg.Callback = function()
+		pcall(function() if setclipboard then setclipboard(url) end end)
+		NotificationManager:Notify({ Title = cfg.Title or "Link Copied", Content = "Copied to clipboard: " .. url, Type = "Info", Duration = 3 })
+		if origCb then origCb(url) end
+	end
+	return ComponentRegistry.Builders["button"](tab, cfg)
+end)
+
+ComponentRegistry:Register("badge", function(tab, cfg)
+	cfg = type(cfg) == "table" and cfg or { Title = tostring(cfg) }
+	cfg.Type = "Badge"; cfg.Save = false
+	local ctrl = ComponentRegistry:CreateBaseCard(tab, cfg, false)
+	local badgePill = Factory.Create("TextLabel", {
+		Size = UDim2.new(0, 0, 0, 20),
+		AutomaticSize = Enum.AutomaticSize.X,
+		Position = UDim2.fromScale(1, 0.5),
+		AnchorPoint = Vector2.new(1, 0.5),
+		Text = tostring(cfg.BadgeText or cfg.Tag or "ACTIVE"),
+		Font = Enum.Font.GothamBold,
+		TextSize = 10,
+		ThemeTag = { BackgroundColor3 = "Accent", TextColor3 = "AccentText" },
+		Parent = ctrl.Content,
+	}, {
+		Factory.Corner(nil, 99),
+		Factory.Padding(nil, 0, 0, 8, 8),
+	})
+	ctrl.SetBadge = function(self, txt) badgePill.Text = tostring(txt) return self end
+	return ctrl
+end)
+
+ComponentRegistry:Register("playerstats", function(tab, cfg)
+	cfg = type(cfg) == "table" and cfg or {}
+	local lp = Players.LocalPlayer
+	cfg.Title = cfg.Title or (lp and lp.DisplayName or "LocalPlayer")
+	cfg.Description = cfg.Description or (lp and ("@" .. lp.Name .. " · UserId: " .. tostring(lp.UserId)) or "Studio Session")
+	return ComponentRegistry.Builders["badge"](tab, {
+		Title = cfg.Title,
+		Description = cfg.Description,
+		BadgeText = "ONLINE",
+	})
+end)
+
+ComponentRegistry:Register("floatingbutton", function(tab, cfg)
+	cfg = type(cfg) == "table" and cfg or { Title = tostring(cfg) }
+	cfg.Type = "FloatingButton"
+	local ctrl = ComponentRegistry.Builders["toggle"](tab, {
+		Title = cfg.Title or "Floating Quick-Action",
+		Description = cfg.Description or "Toggles on-screen draggable mobile macro button",
+		Default = cfg.Default == true,
+		Flag = cfg.Flag,
+	})
+
+	local floatBtn = Factory.Create("TextButton", {
+		Name = "UltraFusion_FloatingMacro",
+		Size = UDim2.fromOffset(52, 52),
+		Position = UDim2.new(0, 24, 0.5, -26),
+		Text = tostring(cfg.FloatText or "MACRO"),
+		Font = Enum.Font.GothamBold,
+		TextSize = 10,
+		Visible = ctrl.Value,
+		ZIndex = 450,
+		ThemeTag = { BackgroundColor3 = "Accent", TextColor3 = "AccentText" },
+		Parent = tab.Window.ScreenGui,
+	}, {
+		Factory.Corner(nil, 16),
+		Factory.Stroke(nil, "BorderStrong", 1.5, 0.2),
+	})
+	ctrl.Maid:Add(floatBtn)
+
+	local dragging, dragStart, startPos, moved = false, nil, nil, false
+	ctrl.Maid:Connect(floatBtn.InputBegan, function(inp)
+		if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+			dragging = true; moved = false; dragStart = inp.Position; startPos = floatBtn.Position
+		end
+	end)
+	ctrl.Maid:Connect(UserInputService.InputChanged, function(inp)
+		if dragging and (inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch) then
+			local delta = inp.Position - dragStart
+			if delta.Magnitude > 5 then moved = true end
+			floatBtn.Position = UDim2.fromOffset(startPos.X.Offset + delta.X, startPos.Y.Offset + delta.Y)
+		end
+	end)
+	ctrl.Maid:Connect(UserInputService.InputEnded, function(inp)
+		if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+	ctrl.Maid:Connect(floatBtn.MouseButton1Click, function()
+		if moved then return end
+		Diagnostics:SafeCallback("FloatingButton", cfg.Callback)
+	end)
+
+	ctrl:OnChanged(function(state)
+		floatBtn.Visible = state == true
+	end)
+	return ctrl
+end)
+
+-- ============================================================================
+-- MODULE 11: WINDOW MANAGER, TAB ENGINE & CROSS-TAB GLOBAL SEARCH
+-- ============================================================================
+local WindowManager = { Windows = {} }
+
+local function bindElementGenerators(target, tab, containerOverride)
+	local function add(typeName, cfg, extra1, extra2)
+		if type(cfg) ~= "table" then
+			if typeName == "paragraph" and extra1 ~= nil then
+				cfg = { Title = tostring(cfg), Description = tostring(extra1) }
+			else
+				cfg = { Title = tostring(cfg) }
+			end
+		else
+			cfg = table.clone(cfg)
+		end
+		if containerOverride then cfg.ParentContainer = containerOverride end
+		local fn = ComponentRegistry.Builders[typeName:lower()]
+		if not fn then return nil end
+		return fn(tab, cfg)
+	end
+
+	function target:AddButton(c) return add("button", c) end
+	function target:AddIconButton(c) return add("iconbutton", c) end
+	function target:AddToggle(idOrC, c)
+		if type(idOrC) == "string" and type(c) == "table" then c.Flag = idOrC return add("toggle", c) end
+		return add("toggle", idOrC)
+	end
+	function target:AddSlider(idOrC, c)
+		if type(idOrC) == "string" and type(c) == "table" then c.Flag = idOrC return add("slider", c) end
+		return add("slider", idOrC)
+	end
+	function target:AddSliderInput(c) return add("sliderinput", c) end
+	function target:AddInput(idOrC, c)
+		if type(idOrC) == "string" and type(c) == "table" then c.Flag = idOrC return add("input", c) end
+		return add("input", idOrC)
+	end
+	function target:AddTextbox(c) return add("textbox", c) end
+	function target:AddDropdown(idOrC, c)
+		if type(idOrC) == "string" and type(c) == "table" then c.Flag = idOrC return add("dropdown", c) end
+		return add("dropdown", idOrC)
+	end
+	function target:AddColorPicker(idOrC, c)
+		if type(idOrC) == "string" and type(c) == "table" then c.Flag = idOrC return add("colorpicker", c) end
+		return add("colorpicker", idOrC)
+	end
+	target.AddColorpicker = target.AddColorPicker
+	function target:AddKeybind(idOrC, c)
+		if type(idOrC) == "string" and type(c) == "table" then c.Flag = idOrC return add("keybind", c) end
+		return add("keybind", idOrC)
+	end
+	target.AddBind = target.AddKeybind
+	function target:AddLabel(t, i, col) return add("label", t, i, col) end
+	function target:AddParagraph(t, d) return add("paragraph", t, d) end
+	function target:AddDivider(c) return add("divider", c) end
+	target.AddSeparator = target.AddDivider
+	function target:AddProgressBar(c) return add("progressbar", c) end
+	function target:AddCode(c) return add("code", c) end
+	function target:AddLinkButton(c) return add("linkbutton", c) end
+	function target:AddBadge(c) return add("badge", c) end
+	function target:AddPlayerStats(c) return add("playerstats", c) end
+	function target:AddFloatingButton(c) return add("floatingbutton", c) end
+
+	-- Rayfield / WindUI / GGH Aliases
+	target.CreateButton = target.AddButton
+	target.CreateToggle = target.AddToggle
+	target.CreateSlider = target.AddSlider
+	target.CreateInput = target.AddInput
+	target.CreateDropdown = target.AddDropdown
+	target.CreateColorPicker = target.AddColorPicker
+	target.CreateKeybind = target.AddKeybind
+	target.CreateLabel = target.AddLabel
+	target.CreateParagraph = target.AddParagraph
+	target.CreateDivider = target.AddDivider
+
+	target.Button = target.AddButton
+	target.Toggle = target.AddToggle
+	target.Slider = target.AddSlider
+	target.SliderInput = target.AddSliderInput
+	target.Input = target.AddInput
+	target.Dropdown = target.AddDropdown
+	target.Colorpicker = target.AddColorPicker
+	target.Keybind = target.AddKeybind
+	target.Label = target.AddLabel
+	target.Paragraph = target.AddParagraph
+	target.Divider = target.AddDivider
+	target.Separator = target.AddDivider
+	target.ProgressBar = target.AddProgressBar
+	target.Code = target.AddCode
+	target.LinkButton = target.AddLinkButton
+	target.PlayerStats = target.AddPlayerStats
+	target.FloatButton = target.AddFloatingButton
+
+	function target:Add(typeName, c)
+		return add(tostring(typeName), c)
+	end
+end
+
+function WindowManager:CreateWindow(cfg)
+	cfg = type(cfg) == "table" and cfg or { Title = tostring(cfg) }
+	local maid = Lifecycle.new()
+
+	local title = tostring(cfg.Title or cfg.Name or "UltraFusion UI")
+	local subTitle = tostring(cfg.SubTitle or cfg.LoadingSubtitle or cfg.Author or "v2.0")
+	ThemeEngine:SetTheme(cfg.Theme or "ObsidianDark", false)
+
+	if cfg.SaveConfig or (type(cfg.ConfigurationSaving) == "table" and cfg.ConfigurationSaving.Enabled) then
+		StateManager.AutoSave = true
+	end
+
+	local screenGui = Factory.Create("ScreenGui", {
+		Name = "UltraFusion_" .. title:gsub("%W+", ""),
+		ResetOnSpawn = false,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		DisplayOrder = 100,
+		Parent = Factory.GetSafeParent(cfg.Parent),
+	})
+	maid:Add(screenGui)
+	NotificationManager:Init(screenGui)
+
+	local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280, 720)
+	local winW = math.clamp(math.floor(vp.X * 0.55), 480, 680)
+	local winH = math.clamp(math.floor(vp.Y * 0.62), 340, 480)
+	if typeof(cfg.Size) == "UDim2" then
+		winW = cfg.Size.X.Offset > 0 and cfg.Size.X.Offset or winW
+		winH = cfg.Size.Y.Offset > 0 and cfg.Size.Y.Offset or winH
+	elseif type(cfg.Width) == "number" and type(cfg.Height) == "number" then
+		winW, winH = cfg.Width, cfg.Height
+	end
+
+	local rootFrame = Factory.Create("Frame", {
+		Name = "MainWindow",
+		Size = UDim2.fromOffset(winW, winH),
+		Position = UDim2.fromOffset(math.floor((vp.X - winW) / 2), math.floor((vp.Y - winH) / 2)),
+		ClipsDescendants = true,
+		ThemeTag = { BackgroundColor3 = "WindowBg", BackgroundTransparency = "WindowTransparency" },
+		Parent = screenGui,
+	}, {
+		Factory.Corner(nil, "CornerWindow"),
+		Factory.Stroke(nil, "Border", 1, 0.25),
+	})
+
+	local topBar = Factory.Create("Frame", {
+		Name = "TopBar",
+		Size = UDim2.new(1, 0, 0, 46),
+		ThemeTag = { BackgroundColor3 = "HeaderBg" },
+		Parent = rootFrame,
+	}, { Factory.Corner(nil, "CornerWindow") })
+
+	Factory.Create("Frame", {
+		Size = UDim2.new(1, 0, 0, 1),
+		Position = UDim2.new(0, 0, 1, -1),
+		ThemeTag = { BackgroundColor3 = "Divider" },
+		Parent = topBar,
+	})
+
+	Factory.Create("TextLabel", {
+		Size = UDim2.new(0.45, -20, 0, 18),
+		Position = UDim2.fromOffset(16, 7),
+		BackgroundTransparency = 1,
+		Text = title,
+		Font = Enum.Font.GothamBold,
+		TextSize = 14,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		ThemeTag = { TextColor3 = "TextPrimary" },
+		Parent = topBar,
+	})
+
+	Factory.Create("TextLabel", {
+		Size = UDim2.new(0.45, -20, 0, 14),
+		Position = UDim2.fromOffset(16, 25),
+		BackgroundTransparency = 1,
+		Text = subTitle,
+		Font = Enum.Font.Gotham,
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		ThemeTag = { TextColor3 = "TextMuted" },
+		Parent = topBar,
+	})
+
+	local searchBox = Factory.Create("TextBox", {
+		Size = UDim2.fromOffset(175, 28),
+		Position = UDim2.new(1, -82, 0.5, 0),
+		AnchorPoint = Vector2.new(1, 0.5),
+		Text = "",
+		PlaceholderText = "Search all tabs...",
+		Font = Enum.Font.Gotham,
+		TextSize = 11,
+		ClearTextOnFocus = false,
+		ThemeTag = { BackgroundColor3 = "InputBg", TextColor3 = "TextPrimary", PlaceholderColor3 = "TextMuted" },
+		Parent = topBar,
+	}, {
+		Factory.Corner(nil, "CornerSmall"),
+		Factory.Stroke(nil, "Border", 1, 0.35),
+		Factory.Padding(nil, 0, 0, 10, 10),
+	})
+
+	local minBtn = Factory.Create("TextButton", {
+		Size = UDim2.fromOffset(28, 28),
+		Position = UDim2.new(1, -44, 0.5, 0),
+		AnchorPoint = Vector2.new(1, 0.5),
+		Text = "—",
+		Font = Enum.Font.GothamBold,
+		TextSize = 12,
+		ThemeTag = { BackgroundColor3 = "ElementBg", TextColor3 = "TextPrimary" },
+		Parent = topBar,
+	}, { Factory.Corner(nil, "CornerSmall") })
+
+	local closeBtn = Factory.Create("TextButton", {
+		Size = UDim2.fromOffset(28, 28),
+		Position = UDim2.new(1, -10, 0.5, 0),
+		AnchorPoint = Vector2.new(1, 0.5),
+		Text = "×",
+		Font = Enum.Font.GothamBold,
+		TextSize = 15,
+		ThemeTag = { BackgroundColor3 = "ElementBg", TextColor3 = "Error" },
+		Parent = topBar,
+	}, { Factory.Corner(nil, "CornerSmall") })
+
+	local sideW = tonumber(cfg.TabWidth or cfg.SideBarWidth) or 165
+	local sidebar = Factory.Create("ScrollingFrame", {
+		Size = UDim2.new(0, sideW, 1, -46),
+		Position = UDim2.fromOffset(0, 46),
+		CanvasSize = UDim2.fromScale(0, 0),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollBarThickness = 2,
+		ThemeTag = { BackgroundColor3 = "SidebarBg", ScrollBarImageColor3 = "Accent" },
+		Parent = rootFrame,
+	}, {
+		Factory.Padding(nil, 10, 10, 10, 10),
+		Factory.Create("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }),
+	})
+
+	local contentArea = Factory.Create("Frame", {
+		Size = UDim2.new(1, -sideW, 1, -46),
+		Position = UDim2.fromOffset(sideW, 46),
+		BackgroundTransparency = 1,
+		Parent = rootFrame,
+	})
+
+	local emptySearchLbl = Factory.Create("TextLabel", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Text = "No matching elements found.",
+		Font = Enum.Font.GothamMedium,
+		TextSize = 13,
+		Visible = false,
+		ThemeTag = { TextColor3 = "TextMuted" },
+		Parent = contentArea,
+	})
+
+	local win = {
+		Title = title,
+		ScreenGui = screenGui,
+		RootFrame = rootFrame,
+		Sidebar = sidebar,
+		ContentArea = contentArea,
+		Tabs = {},
+		ActiveTab = nil,
+		Minimized = false,
+		Hidden = false,
+		SavedSize = UDim2.fromOffset(winW, winH),
+		Maid = maid,
+	}
+
+	local dragging, dragStart, startPos = false, nil, nil
+	maid:Connect(topBar.InputBegan, function(inp)
+		if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+			dragging = true; dragStart = inp.Position; startPos = rootFrame.Position
+		end
+	end)
+	maid:Connect(UserInputService.InputChanged, function(inp)
+		if dragging and (inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch) then
+			local d = inp.Position - dragStart
+			local curVp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1920, 1080)
+			local nx = math.clamp(startPos.X.Offset + d.X, 4, math.max(4, curVp.X - rootFrame.AbsoluteSize.X - 4))
+			local ny = math.clamp(startPos.Y.Offset + d.Y, 4, math.max(4, curVp.Y - rootFrame.AbsoluteSize.Y - 4))
+			rootFrame.Position = UDim2.fromOffset(nx, ny)
+		end
+	end)
+	maid:Connect(UserInputService.InputEnded, function(inp)
+		if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+
+	function win:Minimize()
+		self.Minimized = not self.Minimized
+		if self.Minimized then
+			self.SavedSize = rootFrame.Size
+			sidebar.Visible = false
+			contentArea.Visible = false
+			AnimationManager:Tween(rootFrame, { Size = UDim2.fromOffset(self.SavedSize.X.Offset, 46) }, 0.2)
+		else
+			sidebar.Visible = true
+			contentArea.Visible = true
+			AnimationManager:Tween(rootFrame, { Size = self.SavedSize }, 0.2)
+		end
+		return self
+	end
+
+	function win:SetVisible(v)
+		self.Hidden = not (v == true)
+		rootFrame.Visible = not self.Hidden
+		return self
+	end
+	function win:Toggle() return self:SetVisible(self.Hidden) end
+
+	maid:Connect(minBtn.MouseButton1Click, function() win:Minimize() end)
+	maid:Connect(closeBtn.MouseButton1Click, function()
+		ModalManager:Show(rootFrame, {
+			Title = "Unload Interface",
+			Content = "Are you sure you want to close " .. win.Title .. "?",
+			YesText = "Close",
+			NoText = "Cancel",
+			OnYes = function() win:Destroy() end,
+		})
+	end)
+
+	local toggleKey = cfg.MinimizeKey or cfg.ToggleKey or cfg.ToggleUIKeybind or Enum.KeyCode.RightControl
+	maid:Connect(UserInputService.InputBegan, function(inp, gp)
+		if gp or UserInputService:GetFocusedTextBox() then return end
+		if typeof(toggleKey) == "EnumItem" and inp.KeyCode == toggleKey then
+			win:Toggle()
+		elseif type(toggleKey) == "string" and inp.KeyCode.Name:lower() == toggleKey:lower() then
+			win:Toggle()
+		end
+	end)
+
+	function win:Search(query)
+		query = tostring(query or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+		if query == "" then
+			emptySearchLbl.Visible = false
+			for _, t in ipairs(self.Tabs) do
+				t.Button.Visible = true
+				t.Container.Visible = (t == self.ActiveTab)
+				for _, el in ipairs(t.Elements) do
+					if el.Root then el.Root.Visible = el.Visible ~= false end
+				end
+			end
+			return
+		end
+
+		local total = 0
+		local firstTab = nil
+		for _, t in ipairs(self.Tabs) do
+			local matches = 0
+			local tabMatch = t.Title:lower():find(query, 1, true) ~= nil
+			for _, el in ipairs(t.Elements) do
+				local m = tabMatch
+					or (el.Title and el.Title:lower():find(query, 1, true) ~= nil)
+					or (el.Description and tostring(el.Description):lower():find(query, 1, true) ~= nil)
+				if el.Root then el.Root.Visible = m and (el.Visible ~= false) end
+				if m then matches += 1; total += 1 end
+			end
+			t.Button.Visible = (matches > 0 or tabMatch)
+			if matches > 0 and not firstTab then firstTab = t end
+		end
+		if firstTab and (not self.ActiveTab or not self.ActiveTab.Button.Visible) then
+			self:SelectTab(firstTab)
+		end
+		emptySearchLbl.Visible = (total == 0)
+	end
+
+	maid:Connect(searchBox:GetPropertyChangedSignal("Text"), function()
+		win:Search(searchBox.Text)
+	end)
+
+	function win:SelectTab(tabOrIdx)
+		local target = type(tabOrIdx) == "number" and self.Tabs[tabOrIdx] or tabOrIdx
+		if type(tabOrIdx) == "string" then
+			for _, t in ipairs(self.Tabs) do
+				if t.Title == tabOrIdx then target = t break end
+			end
+		end
+		if not target then return end
+		self.ActiveTab = target
+		for _, t in ipairs(self.Tabs) do
+			local sel = (t == target)
+			t.Selected = sel
+			t.Container.Visible = sel
+			ThemeEngine:Bind(t.Button, {
+				BackgroundColor3 = sel and "Accent" or "ElementBg",
+				TextColor3 = sel and "AccentText" or "TextSecondary",
+			})
+			AnimationManager:Tween(t.Button, {
+				BackgroundColor3 = ThemeEngine:GetToken(sel and "Accent" or "ElementBg"),
+				TextColor3 = ThemeEngine:GetToken(sel and "AccentText" or "TextSecondary"),
+			}, 0.15)
+		end
+	end
+
+	function win:CreateTab(tCfgOrName, iconArg)
+		local tCfg = type(tCfgOrName) == "table" and tCfgOrName or { Title = tostring(tCfgOrName), Icon = iconArg }
+		local tTitle = tostring(tCfg.Title or tCfg.Name or ("Tab " .. tostring(#self.Tabs + 1)))
+		local tIcon = tCfg.Icon or tCfg.Image
+		local tMaid = Lifecycle.new()
+		self.Maid:Add(tMaid)
+
+		local btn = Factory.Create("TextButton", {
+			Size = UDim2.new(1, 0, 0, 32),
+			Text = tTitle,
+			Font = Enum.Font.GothamSemibold,
+			TextSize = 12,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			LayoutOrder = #self.Tabs + 1,
+			ThemeTag = { BackgroundColor3 = "ElementBg", TextColor3 = "TextSecondary" },
+			Parent = sidebar,
+		}, {
+			Factory.Corner(nil, "CornerSmall"),
+			Factory.Padding(nil, 0, 0, tIcon and 30 or 10, 8),
+		})
+		tMaid:Add(btn)
+
+		if tIcon then
+			local ic = Factory.Create("ImageLabel", {
+				Size = UDim2.fromOffset(15, 15),
+				Position = UDim2.new(0, -19, 0.5, 0),
+				AnchorPoint = Vector2.new(0, 0.5),
+				Parent = btn,
+			})
+			IconManager:Apply(ic, tIcon, "TextSecondary")
+		end
+
+		local page = Factory.Create("ScrollingFrame", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			Visible = false,
+			ScrollBarThickness = 3,
+			CanvasSize = UDim2.fromScale(0, 0),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			ThemeTag = { ScrollBarImageColor3 = "Accent" },
+			Parent = contentArea,
+		}, {
+			Factory.Padding(nil, 12, 16, 12, 12),
+			Factory.Create("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }),
+		})
+		tMaid:Add(page)
+
+		local tabObj = {
+			Title = tTitle,
+			Name = tTitle,
+			Window = self,
+			Button = btn,
+			Container = page,
+			Elements = {},
+			IsScrolling = false,
+			Maid = tMaid,
+		}
+
+		tMaid:Connect(page:GetPropertyChangedSignal("CanvasPosition"), function()
+			tabObj.IsScrolling = true
+			task.delay(0.22, function() tabObj.IsScrolling = false end)
+		end)
+
+		function tabObj:RegisterElement(el)
+			table.insert(self.Elements, el)
+			return el
+		end
+
+		function tabObj:AddSection(sCfgOrTitle)
+			local sCfg = type(sCfgOrTitle) == "table" and sCfgOrTitle or { Title = tostring(sCfgOrTitle or "Section") }
+			local sTitle = tostring(sCfg.Title or sCfg.Name or "Section")
+			local opened = sCfg.Opened ~= false
+
+			local secFrame = Factory.Create("Frame", {
+				Size = UDim2.new(1, 0, 0, 0),
+				AutomaticSize = Enum.AutomaticSize.Y,
+				ThemeTag = { BackgroundColor3 = "SectionBg" },
+				Parent = page,
+			}, {
+				Factory.Corner(nil, "CornerElement"),
+				Factory.Stroke(nil, "Divider", 1, 0.5),
+				Factory.Padding(nil, 10, 10, 10, 10),
+				Factory.Create("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }),
+			})
+
+			local hdr = Factory.Create("TextButton", {
+				Size = UDim2.new(1, 0, 0, 18),
+				BackgroundTransparency = 1,
+				Text = sTitle:upper(),
+				Font = Enum.Font.GothamBold,
+				TextSize = 11,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				LayoutOrder = 1,
+				ThemeTag = { TextColor3 = "Accent" },
+				Parent = secFrame,
+			})
+
+			local body = Factory.Create("Frame", {
+				Size = UDim2.new(1, 0, 0, 0),
+				AutomaticSize = Enum.AutomaticSize.Y,
+				BackgroundTransparency = 1,
+				Visible = opened,
+				LayoutOrder = 2,
+				Parent = secFrame,
+			}, {
+				Factory.Create("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }),
+			})
+
+			tMaid:Connect(hdr.MouseButton1Click, function()
+				opened = not opened
+				body.Visible = opened
+			end)
+
+			local secObj = {
+				Title = sTitle,
+				Root = secFrame,
+				Container = body,
+				Set = function(s, t) hdr.Text = tostring(t):upper() return s end,
+			}
+			bindElementGenerators(secObj, tabObj, body)
+			return secObj
+		end
+		tabObj.CreateSection = tabObj.AddSection
+		tabObj.Section = tabObj.AddSection
+
+		bindElementGenerators(tabObj, tabObj, page)
+
+		tMaid:Connect(btn.MouseButton1Click, function()
+			self:SelectTab(tabObj)
+		end)
+
+		table.insert(self.Tabs, tabObj)
+		if #self.Tabs == 1 then self:SelectTab(tabObj) end
+		return tabObj
+	end
+
+	win.AddTab = win.CreateTab
+	win.MakeTab = win.CreateTab
+	win.Tab = win.CreateTab
+	win.Dialog = function(self, c) return ModalManager:Show(rootFrame, c) end
+	win.Confirm = win.Dialog
+	win.Notify = function(self, c) return NotificationManager:Notify(c) end
+	win.SetTheme = function(self, t) return ThemeEngine:SetTheme(t, true) end
+	win.ModifyTheme = win.SetTheme
+
+	function win:Destroy()
+		if maid:IsDestroyed() then return false end
+		local idx = table.find(WindowManager.Windows, self)
+		if idx then table.remove(WindowManager.Windows, idx) end
+		return maid:Destroy()
+	end
+
+	table.insert(self.Windows, win)
+	return win
+end
+
+-- ============================================================================
+-- MODULE 12: MASTER EXPORT & COMPATIBILITY LAYER
+-- ============================================================================
+local UltraFusion = {
+	Version = "2.0.0",
+	Lifecycle = Lifecycle,
+	Diagnostics = Diagnostics,
+	AnimationManager = AnimationManager,
+	ThemeEngine = ThemeEngine,
+	IconManager = IconManager,
+	StateManager = StateManager,
+	NotificationManager = NotificationManager,
+	ModalManager = ModalManager,
+	ComponentRegistry = ComponentRegistry,
+	WindowManager = WindowManager,
+
+	Flags = StateManager.Flags,
+	Options = StateManager.Options,
+	Themes = ThemeEngine.Presets,
+	Icons = IconManager.Assets,
+}
+
+function UltraFusion:CreateWindow(cfg)
+	local w = WindowManager:CreateWindow(cfg)
+	self.Window = w
+	return w
+end
+UltraFusion.MakeWindow = UltraFusion.CreateWindow
+
+function UltraFusion:Notify(cfg)
+	if not NotificationManager.Holder then
+		local g = Factory.Create("ScreenGui", {
+			Name = "UltraFusion_Notifications",
+			ResetOnSpawn = false,
+			DisplayOrder = 200,
+			Parent = Factory.GetSafeParent(),
+		})
+		NotificationManager:Init(g)
+	end
+	return NotificationManager:Notify(cfg)
+end
+UltraFusion.MakeNotification = UltraFusion.Notify
+
+function UltraFusion:SetTheme(t) return ThemeEngine:SetTheme(t, true) end
+function UltraFusion:RegisterTheme(n, t) return ThemeEngine:RegisterCustomTheme(n, t) end
+function UltraFusion:GetIcon(n) local r = IconManager:Resolve(n) return r and r.Image or nil end
+function UltraFusion:SaveConfiguration(p) return StateManager:SaveConfiguration(p) end
+function UltraFusion:LoadConfiguration(p) return StateManager:LoadConfiguration(p) end
+function UltraFusion:ExportJSON() return StateManager:ExportJSON(true) end
+function UltraFusion:ImportJSON(s) return StateManager:ImportJSON(s) end
+function UltraFusion:Init()
+	if StateManager.AutoSave then StateManager:LoadConfiguration("Default") end
+	return self
+end
+function UltraFusion:Destroy()
+	for i = #WindowManager.Windows, 1, -1 do
+		local w = WindowManager.Windows[i]
+		if w then w:Destroy() end
+	end
+	self.Window = nil
+	return true
+end
+
+if getgenv then
+	getgenv().UltraFusion = UltraFusion
+end
+
+return UltraFusion
